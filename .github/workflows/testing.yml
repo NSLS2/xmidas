@@ -33,7 +33,7 @@ jobs:
         # This step is not expected to influence the test, since the test is run in Conda environment
         python-version: 3.9
 
-    - uses: conda-incubator/setup-miniconda@v2
+    - uses: conda-incubator/setup-miniconda@9f54435e0e72c53962ee863144e47a4b094bfd35 # v2
       with:
         channels: conda-forge
         channel-priority: flexible
