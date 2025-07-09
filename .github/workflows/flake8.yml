@@ -1,4 +1,6 @@
 name: Style - FLAKE8
+permissions:
+  contents: read
 
 on: [push, pull_request]
 
