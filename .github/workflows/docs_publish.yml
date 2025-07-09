@@ -28,13 +28,15 @@ jobs:
         export REPOSITORY_NAME=${GITHUB_REPOSITORY#*/}
         echo "REPOSITORY_NAME=${REPOSITORY_NAME}" >> $GITHUB_ENV
     - uses: actions/checkout@v2
+      with:
+        persist-credentials: false
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v2
       with:
         python-version: 3.9
 
-    - uses: conda-incubator/setup-miniconda@v2
+    - uses: conda-incubator/setup-miniconda@9f54435e0e72c53962ee863144e47a4b094bfd35 # v2
       with:
         channels: conda-forge
         channel-priority: flexible
@@ -77,7 +79,7 @@ jobs:
     - name: Deploy documentation to nsls-ii.github.io
       # We pin to the SHA, not the tag, for security reasons.
       # https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/security-hardening-for-github-actions#using-third-party-actions
-      uses: peaceiris/actions-gh-pages@bbdfb200618d235585ad98e965f4aafc39b4c501  # v3.7.3
+      uses: peaceiris/actions-gh-pages@bbdfb200618d235585ad98e965f4aafc39b4c501 # v3.7.3
       with:
         deploy_key: ${{ secrets.ACTIONS_DOCUMENTATION_DEPLOY_KEY }}
         publish_branch: master
