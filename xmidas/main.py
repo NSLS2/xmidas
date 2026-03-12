@@ -2,44 +2,51 @@
 
 # Author: Ajith Pattammattel
 # First Version on:06-23-2020
+#python 3.12 update on July 2025
+__version__ = "1.0.0"
 
 import argparse
 import logging
+import datetime
 import sys
 import webbrowser
 import traceback
 import os
 import json
-import h5py
 import scipy.stats as stats
 import numpy as np
 import pandas as pd
 import tifffile as tf
 import pyqtgraph as pg
 import pyqtgraph.exporters
-import scipy.optimize as opt
-import sklearn.decomposition as sd
-import sklearn.cluster as sc
+import faulthandler
+faulthandler.enable()
 
+
+from glob import glob
 from pyqtgraph import plot
 from itertools import combinations
 from scipy.stats import linregress
-from scipy.signal import savgol_filter
-from skimage.transform import resize
-from skimage import filters
-from sklearn import linear_model
-from larch.xafs import preedge
-from pystackreg import StackReg
 from packaging import version
 
-from PyQt5 import QtWidgets, QtCore, QtGui, uic, QtTest
-from PyQt5.QtGui import QMovie
-from PyQt5.QtWidgets import QMessageBox, QFileDialog, QApplication
-from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QRunnable, QThreadPool, PYQT_VERSION_STR
+from PyQt6 import QtWidgets, QtCore, QtGui, uic, QtTest
+from PyQt6.QtGui import QMovie
+from PyQt6.QtWidgets import QMessageBox, QFileDialog, QApplication
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QRunnable, QThreadPool, PYQT_VERSION_STR, QTimer
 
-from . import __version__
 
-# from MultiChannel import *
+from xmidas.utils.utils import *
+from xmidas.utils.color_maps import create_color_maps
+from xmidas.models.encoders import jsonEncoder
+
+from xmidas.gui.windows.xanes_viewer import XANESViewer
+from xmidas.gui.windows.multichannel_viewer import MultiChannelWindow
+from xmidas.gui.windows.mask_maker import MaskSpecViewer
+from xmidas.gui.windows.singleStackViewer import *
+
+cmap_dict = create_color_maps()
+
+#from . import __version__
 
 logger = logging.getLogger()
 try:
@@ -53,50 +60,20 @@ if hasattr(QtCore.Qt, "AA_EnableHighDpiScaling"):
 if hasattr(QtCore.Qt, "AA_UseHighDpiPixmaps"):
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
-ui_path = os.path.dirname(os.path.abspath(__file__))
+ui_dir = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "gui/layout"
+))
+
+print(ui_dir)
 
 # global settings for pyqtgraph plot and image colormaps
 pg.setConfigOption("imageAxisOrder", "row-major")
-cmap_names = ["CET-L13", "CET-L14", "CET-L15"]
-cmap_combo = combinations(cmap_names, 2)
-cmap_label1 = ["red", "green", "blue"]
-cmap_label2 = ["yellow", "magenta", "cyan"]
-cmap_dict = {}
-for i, name in zip(cmap_names, cmap_label1):
-    cmap_dict[name] = pg.colormap.get(i).getLookupTable(alpha=True)
-
-for i, name in zip(cmap_combo, cmap_label2):
-    cmap_dict[name] = pg.colormap.get(i[0]).getLookupTable(alpha=True) + pg.colormap.get(i[1]).getLookupTable(
-        alpha=True
-    )
-    cmap_dict[name][:, 3] = 255
-
-    grey = (
-        pg.colormap.get("CET-L13").getLookupTable(alpha=True)
-        + pg.colormap.get("CET-L14").getLookupTable(alpha=True)
-        + pg.colormap.get("CET-L15").getLookupTable(alpha=True)
-    )
-
-    grey[:, 3] = 255
-    cmap_dict["grey"] = grey
-
-
-class jsonEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        else:
-            return super(jsonEncoder, self).default(obj)
-
 
 class midasWindow(QtWidgets.QMainWindow):
     def __init__(self, im_stack=None, energy=[], refs=[]):
         super(midasWindow, self).__init__()
-        uic.loadUi(os.path.join(ui_path, "uis/midasMainwindow.ui"), self)
+        uic.loadUi(os.path.join(ui_dir, "midasMainwindow.ui"), self)
         self.im_stack = im_stack
         self.energy = energy
         self.refs = refs
@@ -106,6 +83,28 @@ class midasWindow(QtWidgets.QMainWindow):
         self.isAReload = False
         self.plotWidth = 2
         self.stackStatusDict = {}
+
+        # Performance optimization: debounce timer and cache
+        self.update_timer = QTimer()
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self._do_update_stack)
+        self._pending_update = False
+        
+        # Cache for expensive operations
+        self._cache = {
+            'resize': {},      # {scaling_factor: processed_stack}
+            'outliers': {},    # {nsigma: processed_stack}
+            'smooth': {},      # {window_size: processed_stack}
+            'last_params': {}  # Track last used parameters
+        }
+
+        self.user_wd = os.path.expanduser("~")
+        # self.user_config_path = os.path.join(ui_path,"user_config.json")
+        
+        # if not os.path.exists(self.user_config_path):
+            
+        #     with open(f"{self.user_config_path}", "w") as fp:
+        #         json.dump(self.user_config, fp, indent=4)
 
         self.plt_colors = [
             "g",
@@ -162,6 +161,7 @@ class midasWindow(QtWidgets.QMainWindow):
         self.pb_swapXY_stack.clicked.connect(lambda: self.threadMaker(self.swapStackXY))
         self.pb_reset_img.clicked.connect(self.reloadImageStack)
         self.pb_crop.clicked.connect(self.crop_to_dim)
+        self.pb_apply_crop_to_all.clicked.connect(self.apply_crop_to_all)
         self.pb_crop.clicked.connect(self.view_stack)
         self.sb_scaling_factor.valueChanged.connect(self.view_stack)
         self.pb_ref_xanes.clicked.connect(self.select_ref_file)
@@ -170,8 +170,9 @@ class midasWindow(QtWidgets.QMainWindow):
         # batchjobs
         self.actionPlotAllCorrelations.triggered.connect(self.plotCorrelationsAllCombinations)
 
+        # Use debounced updates for sliders to prevent rapid successive processing
         [
-            uis.valueChanged.connect(self.replot_image)
+            uis.valueChanged.connect(self.schedule_update)
             for uis in [self.hs_smooth_size, self.hs_nsigma, self.hs_bg_threshold]
         ]
 
@@ -203,6 +204,7 @@ class midasWindow(QtWidgets.QMainWindow):
         # save_options
         self.actionSave_Sum_Image.triggered.connect(lambda: self.save_stack(method="sum"))
         self.actionSave_Mean_Image.triggered.connect(lambda: self.save_stack(method="mean"))
+        self.actionExport_Image_to_CSV.triggered.connect(self.stackToCSV)
         self.pb_save_disp_spec.clicked.connect(self.save_disp_spec)
         self.actionSave_Energy_List.triggered.connect(self.saveEnergyList)
         self.pb_show_roi.clicked.connect(self.getROIMask)
@@ -233,13 +235,13 @@ class midasWindow(QtWidgets.QMainWindow):
 
     # View Options
     def darkMode(self):
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/darkStyle.css")).read())
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/darkStyle.css")).read())
 
     def defaultMode(self):
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/defaultStyle.css")).read())
 
     def modernMode(self):
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/modern.css")).read())
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/modern.css")).read())
 
     def setPlotLineWidth(self, width_input):
         self.plotWidth = width_input
@@ -275,12 +277,14 @@ class midasWindow(QtWidgets.QMainWindow):
                     self.update_stack_info,
                     self.update_spectrum,
                     self.update_image_roi,
+                    self.setImageROI
                 ],
             )
         )
 
         # Execute
         self.threadpool.start(worker)
+
 
     # File Loading
 
@@ -291,10 +295,12 @@ class midasWindow(QtWidgets.QMainWindow):
         self.energy = []
         filter = "TIFF (*.tiff);;TIF (*.tif);;all_files (*)"
         file_name = QFileDialog()
-        file_name.setFileMode(QFileDialog.ExistingFiles)
-        names = file_name.getOpenFileNames(self, "Open files", " ", filter)
+        file_name.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        names = file_name.getOpenFileNames(self, "Open files", self.user_wd, filter)
         if names[0]:
+
             self.file_name = names[0]
+            self.user_wd = os.path.dirname(self.file_name[0])
             self.load_stack()
 
         else:
@@ -302,6 +308,7 @@ class midasWindow(QtWidgets.QMainWindow):
             pass
 
     def load_stack(self):
+
         """load the image data from the selected file.
         If the the choice is for multiple files stack will be created in a loop.
         If single h5 file is selected the unpacking will be done with 'get_xrf_data' function in StackCalcs.
@@ -312,6 +319,9 @@ class midasWindow(QtWidgets.QMainWindow):
         The output 'self.im_stack' is the unmodified data file
         """
 
+        # Invalidate cache when loading new data
+        self.invalidate_cache()
+        
         self.log_warning = False  # for the Qmessage box in cb_log
         self.image_roi2_flag = False
         self.cb_log.setChecked(False)
@@ -338,6 +348,7 @@ class midasWindow(QtWidgets.QMainWindow):
         self.statusbar_main.showMessage("Loading.. please wait...")
 
         if isinstance(self.file_name, list):
+
             all_images = []
 
             for im_file in self.file_name:
@@ -348,6 +359,7 @@ class midasWindow(QtWidgets.QMainWindow):
             self.sb_zrange2.setValue(self.im_stack.shape[0])
 
         else:
+
             if self.file_name.endswith(".h5"):
                 self.im_stack, mono_e, bl_name, self.avgIo = get_xrf_data(self.file_name)
                 self.statusbar_main.showMessage(f"Data from {bl_name}")
@@ -404,9 +416,10 @@ class midasWindow(QtWidgets.QMainWindow):
         The filename will be used to load data using 'rest and load stack' function"""
 
         filename = QFileDialog().getOpenFileName(
-            self, "Select image data", "", "image file(*.hdf *.h5 *tiff *tif )"
+            self, "Select image data", self.user_wd, "image file(*.hdf *.h5 *tiff *tif )"
         )
         self.file_name = str(filename[0])
+        self.user_wd = os.path.dirname(self.file_name)
 
         # if user decides to cancel the file window gui returns to original state
         if self.file_name:
@@ -419,6 +432,7 @@ class midasWindow(QtWidgets.QMainWindow):
             pass
 
     def autoEnergyLoader(self):
+
         dir_, filename_ = os.path.split(self.file_name)
         self.efilePath_name = os.path.join(dir_, os.path.splitext(filename_)[0] + ".txt")
         self.efilePath_log = os.path.join(dir_, "maps_log_tiff.txt")
@@ -462,6 +476,46 @@ class midasWindow(QtWidgets.QMainWindow):
                 self.im_stack[self.z1 : self.z2, self.y1 : self.y2, self.x1 : self.x2]
             )
 
+    def apply_crop_to_all(self):
+        dir_ = os.path.dirname(self.file_name)
+        tiffs = glob(dir_+"/*.tiff")
+
+        self.x1, self.x2 = self.sb_xrange1.value(), self.sb_xrange2.value()
+        self.y1, self.y2 = self.sb_yrange1.value(), self.sb_yrange2.value()
+        self.z1, self.z2 = self.sb_zrange1.value(), self.sb_zrange2.value()
+
+        #print(tiffs)
+        save_str = ' '
+        for fname in tiffs:
+            print(fname)
+            im_array = tf.imread(fname)
+            im_name = os.path.join(dir_,os.path.basename(fname).split('.')[0]+"_cropped.tiff")
+            save_path = os.path.relpath(im_name, os.path.expanduser('~'))
+            if np.ndim(im_array) == 3:
+                tf.imwrite(im_name, im_array[self.z1 : self.z2, self.y1 : self.y2, self.x1 : self.x2])
+                save_str+=f"\n{save_path} cropped from {im_array.shape} to (z,y,x):{self.z1}:{self.z2},{self.y1}:{self.y2},{self.x1}:{self.x2}"
+                logger.info(f"{save_path} saved")
+            elif np.ndim(im_array) == 2:
+                tf.imwrite(im_name, im_array[self.y1 : self.y2, self.x1 : self.x2])
+                logger.info(f"{save_path} saved")
+                save_str+=f"\n{save_path} cropped from {im_array.shape} to (z,y,x):{self.y1}:{self.y2},{self.x1}:{self.x2}"
+            else:
+                pass
+
+            print(f"{save_str = }")
+
+        # Get the current date and time
+        current_datetime = datetime.datetime.now()
+        formatted_date_time = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
+
+        # save crop settings
+        file_name = os.path.join(dir_, f"crop_log_{formatted_date_time}.txt")
+
+        with open(file_name, 'w') as file:
+            file.write(save_str)
+
+        #print(f"log saved as '{file_name}'")
+
     def transpose_stack(self):
         self.displayedStack = self.displayedStack.T
         self.update_spectrum()
@@ -470,8 +524,9 @@ class midasWindow(QtWidgets.QMainWindow):
     # Alignement
 
     def loadAlignRefImage(self):
-        filename = QFileDialog().getOpenFileName(self, "Image Data", "", "*.tiff *.tif")
+        filename = QFileDialog().getOpenFileName(self, "Image Data", self.user_wd, "*.tiff *.tif")
         file_name = str(filename[0])
+        self.user_wd = os.path.dirname(file_name)
         self.alignRefImage = tf.imread(file_name)
         assert self.alignRefImage.shape == self.displayedStack.shape, "Image dimensions do not match"
         self.refStackAvailable = True
@@ -479,6 +534,7 @@ class midasWindow(QtWidgets.QMainWindow):
         self.change_color_on_load(self.pb_load_align_ref)
 
     def stackRegistration(self):
+
         self.transformations = {
             "TRANSLATION": StackReg.TRANSLATION,
             "RIGID_BODY": StackReg.RIGID_BODY,
@@ -493,7 +549,9 @@ class midasWindow(QtWidgets.QMainWindow):
         self.alignMaxIter = self.sb_maxIterVal.value()
 
         if self.cb_use_tmatFile.isChecked():
+
             if len(self.loaded_tranform_file) > 0:
+
                 self.displayedStack = align_with_tmat(
                     self.displayedStack, tmat_file=self.loaded_tranform_file, transformation=self.transformType
                 )
@@ -503,6 +561,7 @@ class midasWindow(QtWidgets.QMainWindow):
                 logger.error("No Tranformation File Loaded")
 
         elif self.cb_iterAlign.isChecked():
+
             if not self.refStackAvailable:
                 self.alignRefImage = self.displayedStack
             else:
@@ -535,20 +594,28 @@ class midasWindow(QtWidgets.QMainWindow):
         self.im_stack = self.displayedStack
 
     def exportAlignTransformation(self):
+
+        
+
         file_name = QFileDialog().getSaveFileName(
-            self, "Save Transformation File", "TranformationMatrix.npy", "text file (*.npy)"
-        )
+                                        self, 
+                                        "Save Transformation File", 
+                                        os.path.join(self.user_wd,"TranformationMatrix.npy"), 
+                                        "text file (*.npy)"
+                                        )
         if file_name[0]:
             np.save(file_name[0], self.tranform_file)
+            self.user_wd = os.path.dirname(file_name[0])
         else:
             pass
 
     def importAlignTransformation(self):
-        file_name = QFileDialog().getOpenFileName(self, "Open Transformation File", " ", "text file (*.npy)")
+        file_name = QFileDialog().getOpenFileName(self, "Open Transformation File", self.user_wd, "text file (*.npy)")
         if file_name[0]:
             self.loaded_tranform_file = np.load(file_name[0])
             self.cb_use_tmatFile.setChecked(True)
-            logger.info("Tranformation File Loaded")
+            self.user_wd = os.path.dirname(file_name[0])
+            logger.info("Transformation File Loaded")
         else:
             pass
 
@@ -562,7 +629,7 @@ class midasWindow(QtWidgets.QMainWindow):
         dw = self.splash.width()
         dh = self.splash.height()
         new_x, new_y = px + (0.5 * pw) - dw, py + (0.5 * ph) - dh
-        self.splash.setGeometry(new_x, new_y, dw, dh)
+        self.splash.setGeometry(int(new_x), int(new_y), int(dw), int(dh))
 
         self.splash.show()
 
@@ -570,74 +637,151 @@ class midasWindow(QtWidgets.QMainWindow):
         self.isAReload = True
         self.load_stack()
 
+    def schedule_update(self):
+        """Schedule a debounced update to prevent rapid successive processing."""
+        self.update_timer.stop()
+        self.update_timer.start(300)  # 300ms delay
+        
+    def _do_update_stack(self):
+        """Internal method called by timer to perform the actual update."""
+        self.replot_image()
+        
+    def invalidate_cache(self):
+        """Clear all cached results when base stack changes."""
+        self._cache = {
+            'resize': {},
+            'outliers': {},
+            'smooth': {},
+            'last_params': {}
+        }
+        logger.info("Cache invalidated")
+
     def update_stack(self):
-        self.displayedStack = self.im_stack
-        self.crop_to_dim()
+        """Update the displayed stack with all selected modifications.
+        
+        Uses caching to avoid redundant processing of expensive operations.
+        
+        OPERATION ORDER (FIXED):
+        The operations are applied in a specific order optimized for:
+        1. Performance (reduce data size early)
+        2. Correctness (irreversible operations like log/edge removal in proper sequence)
+        
+        Order:
+        1. Resize/Rebin - Reduces data size for faster subsequent operations
+        2. Remove Edges - Reduces data size, IRREVERSIBLE
+        3. Remove Outliers - Pixel-level operation
+        4. Remove Background - Threshold-based filtering
+        5. Log Transform - IRREVERSIBLE, changes data scale
+        6. Smoothing - Works on any scale
+        7. Normalization - Final scaling step
+        
+        Note: If you need a different order, you'll need to apply operations
+        manually in sequence rather than using checkboxes simultaneously.
+        """
+        # Show busy cursor during processing
+        QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        
+        try:
+            self.displayedStack = self.im_stack
+            self.crop_to_dim()
 
-        if self.cb_rebin.isChecked():
-            self.cb_upscale.setChecked(False)
-            self.sb_scaling_factor.setEnabled(True)
-            self.displayedStack = resize_stack(self.displayedStack, scaling_factor=self.sb_scaling_factor.value())
-            self.update_stack_info()
+            # OPTIMIZATION 1: Resize/rebin first to reduce data size for subsequent operations
+            if self.cb_rebin.isChecked():
+                self.cb_upscale.setChecked(False)
+                self.sb_scaling_factor.setEnabled(True)
+                scaling_factor = self.sb_scaling_factor.value()
+                
+                # Check cache
+                cache_key = f"rebin_{scaling_factor}"
+                if cache_key in self._cache['resize']:
+                    self.displayedStack = self._cache['resize'][cache_key]
+                    logger.info(f"Using cached rebin result (factor={scaling_factor})")
+                else:
+                    self.displayedStack = resize_stack(self.displayedStack, scaling_factor=scaling_factor)
+                    self._cache['resize'][cache_key] = self.displayedStack.copy()
+                self.update_stack_info()
 
-        elif self.cb_upscale.isChecked():
-            self.cb_rebin.setChecked(False)
-            self.sb_scaling_factor.setEnabled(True)
-            self.displayedStack = resize_stack(
-                self.displayedStack, upscaling=True, scaling_factor=self.sb_scaling_factor.value()
-            )
-            self.update_stack_info()
+            elif self.cb_upscale.isChecked():
+                self.cb_rebin.setChecked(False)
+                self.sb_scaling_factor.setEnabled(True)
+                scaling_factor = self.sb_scaling_factor.value()
+                
+                # Check cache
+                cache_key = f"upscale_{scaling_factor}"
+                if cache_key in self._cache['resize']:
+                    self.displayedStack = self._cache['resize'][cache_key]
+                    logger.info(f"Using cached upscale result (factor={scaling_factor})")
+                else:
+                    self.displayedStack = resize_stack(
+                        self.displayedStack, upscaling=True, scaling_factor=scaling_factor
+                    )
+                    self._cache['resize'][cache_key] = self.displayedStack.copy()
+                self.update_stack_info()
 
-        if self.cb_remove_outliers.isChecked():
-            self.hs_nsigma.setEnabled(True)
-            nsigma = self.hs_nsigma.value() / 10
-            self.displayedStack = remove_hot_pixels(self.displayedStack, NSigma=nsigma)
-            self.label_nsigma.setText(str(nsigma))
-            logger.info(f"Removing Outliers with NSigma {nsigma}")
+            # OPTIMIZATION 2: Remove edges early to reduce data size
+            if self.cb_remove_edges.isChecked():
+                self.displayedStack = remove_edges(self.displayedStack)
+                logger.info(f"Removed edges, new shape {self.displayedStack.shape}")
+                self.update_stack_info()
 
-        elif self.cb_remove_outliers.isChecked() is False:
-            self.hs_nsigma.setEnabled(False)
+            # Outlier removal with caching
+            if self.cb_remove_outliers.isChecked():
+                self.hs_nsigma.setEnabled(True)
+                nsigma = self.hs_nsigma.value() / 10
+                
+                # Only cache if this is the ONLY operation (no subsequent ops that would be skipped)
+                # Otherwise the cache would bypass operations like log transform
+                self.displayedStack = remove_hot_pixels(self.displayedStack, NSigma=nsigma)
+                    
+                self.label_nsigma.setText(str(nsigma))
+                logger.info(f"Removing Outliers with NSigma {nsigma}")
+            else:
+                self.hs_nsigma.setEnabled(False)
 
-        if self.cb_remove_edges.isChecked():
-            self.displayedStack = remove_edges(self.displayedStack)
-            logger.info(f"Removed edges, new shape {self.displayedStack.shape}")
-            self.update_stack_info()
+            # Background removal
+            if self.cb_remove_bg.isChecked():
+                self.hs_bg_threshold.setEnabled(True)
+                logger.info("Removing background")
+                bg_threshold = self.hs_bg_threshold.value()
+                self.label_bg_threshold.setText(str(bg_threshold) + "%")
+                self.displayedStack = clean_stack(self.displayedStack, auto_bg=False, bg_percentage=bg_threshold)
+            else:
+                self.hs_bg_threshold.setEnabled(False)
 
-        if self.cb_remove_bg.isChecked():
-            self.hs_bg_threshold.setEnabled(True)
-            logger.info("Removing background")
-            bg_threshold = self.hs_bg_threshold.value()
-            self.label_bg_threshold.setText(str(bg_threshold) + "%")
-            self.displayedStack = clean_stack(self.displayedStack, auto_bg=False, bg_percentage=bg_threshold)
+            # Log transform
+            if self.cb_log.isChecked():
+                self.displayedStack = remove_nan_inf(np.log10(self.displayedStack))
+                logger.info("Log Stack is in use")
 
-        elif self.cb_remove_bg.isChecked() is False:
-            self.hs_bg_threshold.setEnabled(False)
+            # Smoothing (removed caching to prevent pipeline issues)
+            if self.cb_smooth.isChecked():
+                self.hs_smooth_size.setEnabled(True)
+                window = self.hs_smooth_size.value()
+                if window % 2 == 0:
+                    window += 1
+                    
+                self.displayedStack = smoothen(self.displayedStack, w_size=window)
+                    
+                self.smooth_winow_size.setText("Window size: " + str(window))
+                logger.info("Spectrum Smoothening Applied")
+            else:
+                self.hs_smooth_size.setEnabled(False)
 
-        if self.cb_log.isChecked():
-            self.displayedStack = remove_nan_inf(np.log10(self.displayedStack))
-            logger.info("Log Stack is in use")
+            # Normalization (fast operation, no caching needed)
+            if self.cb_norm.isChecked():
+                logger.info("Normalizing spectra")
+                self.displayedStack = normalize(self.displayedStack, norm_point=-1)
 
-        if self.cb_smooth.isChecked():
-            self.hs_smooth_size.setEnabled(True)
-            window = self.hs_smooth_size.value()
-            if window % 2 == 0:
-                window = +1
-            self.smooth_winow_size.setText("Window size: " + str(window))
-            self.displayedStack = smoothen(self.displayedStack, w_size=window)
-            logger.info("Spectrum Smoothening Applied")
-
-        elif self.cb_smooth.isChecked() is False:
-            self.hs_smooth_size.setEnabled(False)
-
-        if self.cb_norm.isChecked():
-            logger.info("Normalizing spectra")
-            self.displayedStack = normalize(self.displayedStack, norm_point=-1)
-
-        logger.info("Updated image is in use")
+            logger.info("Updated image is in use")
+            
+        finally:
+            # Always restore cursor
+            QApplication.restoreOverrideCursor()
 
     # ImageView
 
     def view_stack(self):
+
         if not self.im_stack.ndim == 3:
             raise ValueError("stack should be an ndarray with ndim == 3")
         else:
@@ -691,13 +835,14 @@ class midasWindow(QtWidgets.QMainWindow):
         if not self.isAReload:
             # image connections
             self.image_view.mousePressEvent = self.getPointSpectrum
-            self.spec_roi.sigRegionChanged.connect(self.update_image_roi)
-            self.spec_roi_math.sigRegionChangeFinished.connect(self.spec_roi_calc)
             self.pb_apply_spec_calc.clicked.connect(self.spec_roi_calc)
             self.rb_math_roi.clicked.connect(self.update_spectrum)
             self.pb_add_roi_2.clicked.connect(self.math_img_roi_flag)
             self.image_roi_math.sigRegionChangeFinished.connect(self.image_roi_calc)
             self.pb_apply_img_calc.clicked.connect(self.image_roi_calc)
+
+        self.spec_roi.sigRegionChanged.connect(self.update_image_roi)
+        self.spec_roi_math.sigRegionChangeFinished.connect(self.spec_roi_calc)
 
         [
             rbs.clicked.connect(self.setImageROI)
@@ -718,7 +863,9 @@ class midasWindow(QtWidgets.QMainWindow):
         self.view_stack()
 
     def efileLoader(self):
+
         if self.efilePath:
+
             if str(self.efilePath).endswith("log_tiff.txt"):
                 self.energy = energy_from_logfile(logfile=str(self.efilePath))
                 logger.info("Log file from pyxrf processing")
@@ -736,6 +883,7 @@ class midasWindow(QtWidgets.QMainWindow):
         # assert len(self.energy) == self.dim1, "Number of Energy Points is not equal to stack length"
 
     def energyUnitCheck(self):
+
         if np.max(self.energy) < 100:
             self.cb_kev_flag.setChecked(True)
             self.energy *= 1000
@@ -746,23 +894,30 @@ class midasWindow(QtWidgets.QMainWindow):
     def select_ref_file(self):
         self.pb_xanes_fit.setEnabled(True)
         self.ref_names = []
-        file_name = QFileDialog().getOpenFileName(self, "Open reference file", "", "text file (*.txt *.nor)")
+        file_name = QFileDialog().getOpenFileName(self, "Open reference file", self.user_wd, "text file (*.csv *.nor)")
         if file_name[0]:
             if file_name[0].endswith(".nor"):
-                self.refs, self.ref_names = create_df_from_nor_try2(athenafile=str(file_name[0]))
+                self.refs, self.ref_names = create_df_from_nor_try2(athenafile=file_name[0])
                 self.change_color_on_load(self.pb_ref_xanes)
 
-            elif file_name[0].endswith(".txt"):
-                self.refs = pd.read_csv(str(file_name[0]), header=None, delim_whitespace=True)
+            elif file_name[0].endswith(".csv"):
+                self.refs = pd.read_csv(file_name[0])
+                self.ref_names = list(self.refs.keys())
+                
                 self.change_color_on_load(self.pb_ref_xanes)
+
+            self.user_wd = os.path.dirname(file_name[0])
 
         else:
             logger.error("No file selected")
             pass
 
+        logger.info(f"{self.refs.shape = }")
+
         self.plt_xanes_refs()
 
     def plt_xanes_refs(self):
+
         try:
             self.ref_plot.close()
         except Exception:
@@ -774,6 +929,7 @@ class midasWindow(QtWidgets.QMainWindow):
         self.ref_plot.addLegend()
 
         for n in range(np.shape(self.refs)[1]):
+
             if not n == 0:
                 self.ref_plot.plot(
                     self.refs.values[:, 0],
@@ -783,15 +939,15 @@ class midasWindow(QtWidgets.QMainWindow):
                 )
 
     def getPointSpectrum(self, event):
-        if event.type() == QtCore.QEvent.MouseButtonDblClick:
-            if event.button() == QtCore.Qt.LeftButton:
-                self.xpixel = int(self.image_view.view.mapSceneToView(event.pos()).x()) - 1
+        if event.type() == QtCore.QEvent.Type.MouseButtonDblClick:
+            if event.button() == QtCore.Qt.MouseButton.LeftButton:
+                self.xpixel = int(self.image_view.view.mapSceneToView(event.pos().toPointF()).x()) - 1
                 zlim, ylim, xlim = self.displayedStack.shape
 
                 if self.xpixel > xlim:
                     self.xpixel = xlim - 1
 
-                self.ypixel = int(self.image_view.view.mapSceneToView(event.pos()).y()) - 1
+                self.ypixel = int(self.image_view.view.mapSceneToView(event.pos().toPointF()).y()) - 1
                 if self.ypixel > ylim:
                     self.ypixel = ylim - 1
                 self.spectrum_view.addLegend()
@@ -812,6 +968,7 @@ class midasWindow(QtWidgets.QMainWindow):
                 self.statusbar_main.showMessage(f"{self.xpixel} and {self.ypixel}")
 
     def setImageROI(self):
+
         self.lineROI = pg.LineSegmentROI([[int(self.dim3 // 2), int(self.dim2 // 2)], [self.sz, self.sz]], pen="r")
 
         self.rectROI = pg.RectROI(
@@ -886,6 +1043,7 @@ class midasWindow(QtWidgets.QMainWindow):
         self.spec_roi_math.setBounds([self.xdata[0], self.xdata[-1]])
 
     def update_spectrum(self):
+
         # set x-axis values; array taken from energy values, if clipped z box values will update the array
         self.xdata = self.energy[self.sb_zrange1.value() : self.sb_zrange2.value()]
 
@@ -980,6 +1138,7 @@ class midasWindow(QtWidgets.QMainWindow):
             self.spectrum_view.removeItem(self.spec_roi_math)
 
     def spec_roi_calc(self):
+
         self.spec_lo_m, self.spec_hi_m = self.spec_roi_math.getRegion()
         self.spec_lo_m_idx = (np.abs(self.energy - self.spec_lo_m)).argmin()
         self.spec_hi_m_idx = (np.abs(self.energy - self.spec_hi_m)).argmin()
@@ -1005,6 +1164,7 @@ class midasWindow(QtWidgets.QMainWindow):
             self.image_view.setImage(self.disp_img)
 
     def math_img_roi_flag(self):
+
         button_name = self.sender().text()
         logger.info(f"{button_name}")
         if button_name == "Add ROI_2":
@@ -1021,6 +1181,7 @@ class midasWindow(QtWidgets.QMainWindow):
             logger.error("Unknown signal for second ROI")
 
     def image_roi_calc(self):
+
         if self.image_roi2_flag == 1:
             self.calc = {"Divide": np.divide, "Subtract": np.subtract, "Add": np.add}
             self.update_spec_image_roi()
@@ -1029,16 +1190,19 @@ class midasWindow(QtWidgets.QMainWindow):
             return
 
     def update_spec_image_roi(self):
+
         self.math_roi_reg = self.image_roi_math.getArrayRegion(
             self.displayedStack, self.image_view.imageItem, axes=(1, 2)
         )
         if self.math_roi_reg.ndim == 3:
+
             self.math_roi_spectra = get_mean_spectra(self.math_roi_reg)
 
         elif self.roi_img_stk.ndim == 2:
             self.math_roi_spectra = self.math_roi_reg.mean(-1)
 
         if self.cb_img_roi_action.currentText() in self.calc.keys():
+
             calc_spec = self.calc[self.cb_img_roi_action.currentText()](self.mean_spectra, self.math_roi_spectra)
             self.spectrum_view.addLegend()
             self.spectrum_view.plot(
@@ -1060,7 +1224,9 @@ class midasWindow(QtWidgets.QMainWindow):
         self.spectrum_view.addItem(self.spec_roi)
 
     def displayStackInfo(self):
+
         try:
+
             if isinstance(self.file_name, list):
                 info = f"Folder; {os.path.dirname(self.file_name[0])} \n"
                 for n, name in enumerate(self.file_name):
@@ -1120,6 +1286,28 @@ class midasWindow(QtWidgets.QMainWindow):
             )
             # logger.info(f" corrlation plot of {self.corrImg1} vs {self.corrImg2}")
 
+    def stackToCSV(self):
+
+        self.stackIndexToNames()
+        self.imageDf = pd.DataFrame()
+        if len(self.elemFileName) == len(self.displayedStack):
+            for name, image in zip(self.elemFileName, self.displayedStack):
+                self.imageDf[f'{name}'] = image.flatten()
+        # print(self.imageDf.head())
+        else:
+            self.imageDf = image_to_pandas2(self.displayedStack)
+
+        file_name = QFileDialog().getSaveFileName(self, 
+                                                  "Save CSV Data", 
+                                                  os.path.join(self.user_wd,'image_2DArray.csv'), 
+                                                  'file (*csv)')
+        if file_name[0]:
+            self.imageDf.to_csv(path_or_buf=file_name[0])
+            self.user_wd = os.path.dirname(file_name[0])
+            self.statusbar_main.showMessage(f"Data saved to {file_name[0]}")
+        else:
+            pass
+
     def correlation_plot(self):
         self.stackIndexToNames()
 
@@ -1136,18 +1324,14 @@ class midasWindow(QtWidgets.QMainWindow):
             )
 
         else:
+
             self.scatter_window = ScatterPlot(self.img1, self.img2, (str(self.corrImg1), str(self.corrImg2)))
 
-        # ph = self.geometry().height()
-        # pw = self.geometry().width()
-        # px = self.geometry().x()
-        # py = self.geometry().y()
-        # dw = self.scatter_window.width()
-        # dh = self.scatter_window.height()
-        # self.scatter_window.setGeometry(px+0.65*pw, py + ph - 2*dh-5, dw, dh)
         self.scatter_window.show()
 
     def plotCorrelationsAllCombinations(self):
+
+        print("Plotting all correlations")
         self.stackIndexToNames()
         allElemCombNum = list(combinations(np.arange(len(self.elemFileName)), 2))
 
@@ -1180,6 +1364,7 @@ class midasWindow(QtWidgets.QMainWindow):
         }
 
         if len(allElemCombNum) > len(self.scWindowDict):
+
             reply = QMessageBox.warning(
                 self,
                 "Plot Window Limit",
@@ -1187,11 +1372,12 @@ class midasWindow(QtWidgets.QMainWindow):
                 f"maxiumum number of "
                 f"plot windows. First {len(self.scWindowDict)} "
                 f"combinations will be plotted. \n      Proceed?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
 
-            if reply == QMessageBox.Yes:
+            if reply == QMessageBox.StandardButton.Yes:
+
                 for i, pair in enumerate(allElemCombNum):
                     im1 = self.displayedStack[pair[0]]
                     im2 = self.displayedStack[pair[1]]
@@ -1201,8 +1387,19 @@ class midasWindow(QtWidgets.QMainWindow):
                     self.scWindowDict[i] = ScatterPlot(im1, im2, (str(im1Name), str(im2Name)))
                     self.scWindowDict[i].show()
 
-            if reply == QMessageBox.No:
+            if reply == QMessageBox.StandardButton.No:
                 return
+
+        else:
+
+            for i, pair in enumerate(allElemCombNum):
+                im1 = self.displayedStack[pair[0]]
+                im2 = self.displayedStack[pair[1]]
+                im1Name = self.elemFileName[pair[0]]
+                im2Name = self.elemFileName[pair[1]]
+
+                self.scWindowDict[i] = ScatterPlot(im1, im2, (str(im1Name), str(im2Name)))
+                self.scWindowDict[i].show()
 
     def getROIMask(self):
         self.roi_mask = self.image_roi.getArrayRegion(self.displayedStack, self.image_view.imageItem, axes=(1, 2))
@@ -1210,32 +1407,43 @@ class midasWindow(QtWidgets.QMainWindow):
         self.newWindow.show()
 
     def save_stack(self, method="raw"):
+
         # self.update_stack()
         file_name = QFileDialog().getSaveFileName(
-            self, "Save image data", "image_data.tiff", "image file(*tiff *tif )"
+            self, 
+            "Save image data", 
+            os.path.join(self.user_wd,"image_data.tiff"), 
+            "image file(*tiff *tif )"
         )
         if file_name[0]:
             if method == "raw":
-                tf.imsave(str(file_name[0]), self.displayedStack)
-                logger.info(f"Updated Image Saved: {str(file_name[0])}")
-                self.statusbar_main.showMessage(f"Updated Image Saved: {str(file_name[0])}")
+
+                tf.imwrite(file_name[0], self.displayedStack)
+                logger.info(f"Updated Image Saved: {file_name[0]}")
+                self.statusbar_main.showMessage(f"Updated Image Saved: {file_name[0]}")
             elif method == "sum":
-                tf.imsave(str(file_name[0]), np.sum(self.displayedStack, axis=0))
+                tf.imwrite(file_name[0], np.sum(self.displayedStack, axis=0))
 
             elif method == "mean":
-                tf.imsave(str(file_name[0]), np.mean(self.displayedStack, axis=0))
+                tf.imwrite(file_name[0], np.mean(self.displayedStack, axis=0))
+
+            self.user_wd = os.path.dirname(file_name[0])
 
         else:
             self.statusbar_main.showMessage("Saving cancelled")
-            logger.info(f"Save failed: {str(file_name[0])}")
+            logger.info(f"Save failed: {file_name[0]}")
             pass
 
     def save_disp_img(self):
-        file_name = QFileDialog().getSaveFileName(self, "Save image data", "image.tiff", "image file(*tiff *tif )")
+        file_name = QFileDialog().getSaveFileName(self, 
+                                                  "Save image data",
+                                                    os.path.join(self.user_wd,"image.tiff"), 
+                                                    "image file(*tiff *tif )")
         if file_name[0]:
-            tf.imsave(str(file_name[0]), self.disp_img)
-            self.statusbar_main.showMessage(f"Image Saved to {str(file_name[0])}")
-            logger.info(f"Updated Image Saved: {str(file_name[0])}")
+            tf.imwrite(file_name[0], self.disp_img)
+            self.statusbar_main.showMessage(f"Image Saved to {file_name[0]}")
+            self.user_wd = os.path.dirname(file_name[0])
+            logger.info(f"Updated Image Saved: {file_name[0]}")
 
         else:
             logger.error("No file to save")
@@ -1244,6 +1452,7 @@ class midasWindow(QtWidgets.QMainWindow):
 
     def getLivePlotData(self):
         try:
+
             data = np.squeeze([c.getData() for c in self.spectrum_view.plotItem.curves])
             # print(np.shape(data))
             if data.ndim == 2:
@@ -1280,13 +1489,19 @@ class midasWindow(QtWidgets.QMainWindow):
     def initNormVals(self):
         self.getLivePlotData()
         e0_init = self.e_[np.argmax(np.gradient(self.mu_))]
-        pre1, pre2, post1, post2 = xanesNormalization(
-            self.e_, self.mu_, e0=e0_init, step=None, nnorm=1, nvict=0, guess=True
+        pre_edge, post_edge, norm = xanesNormalization(
+            self.e_,
+            self.mu_,
+            e0=e0_init,
+            nnorm=1,
+            nvict=0,
         )
-        self.dsb_norm_pre1.setValue(pre1)
-        self.dsb_norm_pre2.setValue(pre2)
-        self.dsb_norm_post1.setValue(post1)
-        self.dsb_norm_post2.setValue(post2)
+        # xanesNormalization now returns arrays, not scalar bounds
+        # Set reasonable default bounds for the UI based on standard XANES practice
+        self.dsb_norm_pre1.setValue(-50)  # 50 eV before edge
+        self.dsb_norm_pre2.setValue(-20)  # 20 eV before edge
+        self.dsb_norm_post1.setValue(50)   # 50 eV after edge
+        self.dsb_norm_post2.setValue(150)  # 150 eV after edge
         self.dsb_norm_Eo.setValue(e0_init)
 
     def getNormParams(self):
@@ -1309,18 +1524,22 @@ class midasWindow(QtWidgets.QMainWindow):
         self.xanesNormParam["norm_order"] = norm_order
 
         file_name = QtWidgets.QFileDialog().getSaveFileName(
-            self, "Save XANES Norm Params", "xanes_norm_params.csv", "csv file(*csv)"
+            self, 
+            "Save XANES Norm Params", 
+            os.path.join(self.user_wd,"xanes_norm_params.csv"), 
+            "csv file(*csv)"
         )
-
         if file_name[0]:
             pd.DataFrame(self.xanesNormParam, index=[0]).to_csv(file_name[0])
+            self.user_wd = os.path.dirname(file_name[0])
 
         else:
             pass
 
     def importNormParams(self):
+
         file_name = QtWidgets.QFileDialog().getOpenFileName(
-            self, "Open a XANES Norm File", "", "csv file(*csv);;all_files (*)"
+            self, "Open a XANES Norm File", self.user_wd, "csv file(*csv);;all_files (*)"
         )
 
         if file_name[0]:
@@ -1331,34 +1550,55 @@ class midasWindow(QtWidgets.QMainWindow):
             self.dsb_norm_post1.setValue(xanesNormParam["post1"])
             self.dsb_norm_post2.setValue(xanesNormParam["post2"])
             self.sb_norm_order.setValue(xanesNormParam["norm_order"])
+            self.user_wd = os.path.dirname(file_name[0])
 
     def nomalizeLiveSpec(self):
         eo_, pre1_, pre2_, norm1_, norm2_, norm_order = self.getNormParams()
         self.spectrum_view.clear()
-
-        pre_line, post_line, normXANES = xanesNormalization(
-            self.e_,
-            self.mu_,
-            e0=eo_,
-            step=None,
-            nnorm=norm_order,
-            nvict=0,
-            pre1=pre1_,
-            pre2=pre2_,
-            norm1=norm1_,
-            norm2=norm2_,
-        )
-
-        names = np.array(("Spectrum", "Pre", "Post"))
-        data_array = np.array((self.mu_, pre_line, post_line))
         colors = np.array(("c", "r", "m"))
+
+        if self.cb_mback.isChecked():
+            pass
+            # f2, normXANES = xanesNormalization(
+            #     self.e_,
+            #     self.mu_,
+            #     e0=eo_,
+            #     nnorm=norm_order,
+            #     nvict=0,
+            #     pre1=pre1_,
+            #     pre2=pre2_,
+            #     norm1=norm1_,
+            #     norm2=norm2_,
+            #     useFlattened=self.cb_xanes_flat.isChecked(),
+            # )
+
+            # names = np.array(("matched mu(E)", "f2"))
+            # data_array = np.array((normXANES, f2))
+
+        else:
+            pre_line, post_line, normXANES = xanesNormalization(
+                self.e_,
+                self.mu_,
+                e0=eo_,
+                nnorm=norm_order,
+                nvict=0,
+                pre1=pre1_,
+                pre2=pre2_,
+                norm1=norm1_,
+                norm2=norm2_,
+                useFlattened=self.cb_xanes_flat.isChecked()
+            )
+
+            names = np.array(("Spectrum", "Pre", "Post"))
+            data_array = np.array((self.mu_, pre_line, post_line))
+
 
         for data, clr, name in zip(data_array, colors, names):
             self.spectrum_view.plot(self.e_, data, pen=pg.mkPen(clr, width=self.plotWidth), name=name)
 
         self.spectrum_view_norm.plot(
-            self.e_, normXANES, clear=True, pen=pg.mkPen(self.plt_colors[-1], width=self.plotWidth)
-        )
+            self.e_, normXANES, clear=True, pen=pg.mkPen(self.plt_colors[-1], width=self.plotWidth))
+
         self.spectrum_view_norm.setLabel("bottom", "Energy", self.e_unit)
         self.spectrum_view_norm.setLabel("left", "Norm. Intensity", "A.U.")
 
@@ -1370,13 +1610,13 @@ class midasWindow(QtWidgets.QMainWindow):
             self.e_,
             self.displayedStack,
             e0=eo_,
-            step=None,
             nnorm=norm_order,
             nvict=0,
             pre1=pre1_,
             pre2=pre2_,
             norm1=norm1_,
             norm2=norm2_,
+            ignorePostEdgeNorm=self.cb_xanes_postedge.isChecked()
         )
         # self.im_stack = self.displayedStack
 
@@ -1394,38 +1634,57 @@ class midasWindow(QtWidgets.QMainWindow):
 
     def saveCollectorPlot(self):
         exporter = pg.exporters.CSVExporter(self.spectrum_view_collect.plotItem)
-        exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
-        file_name = QFileDialog().getSaveFileName(self, "save spectra", "", "spectra (*csv)")
+        #exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
+        file_name = QFileDialog().getSaveFileName(self, "save spectra", self.user_wd, "spectra (*csv)")
         if file_name[0]:
-            exporter.export(str(file_name[0]) + ".csv")
+            exporter.export(file_name[0] + ".csv")
+            self.user_wd = os.path.dirname(file_name[0])
         else:
             self.statusbar_main.showMessage("Saving cancelled")
             pass
 
     def save_disp_spec(self):
+
         exporter = pg.exporters.CSVExporter(self.spectrum_view.plotItem)
-        exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
-        file_name = QFileDialog().getSaveFileName(self, "save spectrum", "", "spectra (*csv)")
+        #exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
+        file_name = QFileDialog().getSaveFileName(self, 
+                                                  "save spectrum", 
+                                                  os.path.join(self.user_wd,"spectrum.csv"), 
+                                                  "spectra (*csv)")
         if file_name[0]:
-            exporter.export(str(file_name[0]) + ".csv")
+            exporter.export(file_name[0] + ".csv")
+            self.user_wd = os.path.dirname(file_name[0])
         else:
             self.statusbar_main.showMessage("Saving cancelled")
             pass
 
     def saveEnergyList(self):
-        file_name = QFileDialog().getSaveFileName(self, "save energy list", "energy_list.txt", "text file (*txt)")
+        file_name = QFileDialog().getSaveFileName(self, 
+                                                  "save energy list", 
+                                                  os.path.join(self.user_wd,"energy_list.txt"), 
+                                                  "text file (*txt)")
         if file_name[0]:
             np.savetxt(file_name[0], self.xdata, fmt="%.4f")
+            self.user_wd = os.path.dirname(file_name[0])
         else:
             pass
 
     def pca_scree_(self):
         logger.info("Process started..")
         self.update_stack()
-        pca_scree(self.displayedStack)
+        var = pca_scree(self.displayedStack)
+
+        pca_scree_plot = pg.plot(
+            var[:24], title="Scree Plot", pen=pg.mkPen("y", width=2, style=QtCore.Qt.DotLine), symbol="o"
+        )
+        pca_scree_plot.addLine(y=0)
+        pca_scree_plot.setLabel("bottom", "Component Number")
+        pca_scree_plot.setLabel("left", "Singular Values")
+
         logger.info("Process complete")
 
     def calc_comp_(self):
+
         logger.info("Process started..")
 
         # self.update_stack()
@@ -1447,7 +1706,13 @@ class midasWindow(QtWidgets.QMainWindow):
 
         with pg.BusyCursor():
             try:
-                kmeans_variance(self.displayedStack)
+                clust_n, var = kmeans_variance(self.displayedStack)
+                kmeans_var_plot = pg.plot(
+                    clust_n, var, title="KMeans Variance", pen=pg.mkPen("y", width=2, style=QtCore.Qt.DotLine),
+                    symbol="o"
+                )
+                kmeans_var_plot.setLabel("bottom", "Cluster Number")
+                kmeans_var_plot.setLabel("left", "Sum of squared distances")
                 logger.info("Process complete")
             except OverflowError:
                 pass
@@ -1462,6 +1727,7 @@ class midasWindow(QtWidgets.QMainWindow):
         self.threadpool.start(worker)
 
     def clustering_(self):
+
         logger.info("Process started..")
         # self.update_stack()
         method_ = self.cb_clust_method.currentText()
@@ -1484,10 +1750,14 @@ class midasWindow(QtWidgets.QMainWindow):
         button_name.setStyleSheet("background-color : rgb(0,150,0);" "color: rgb(255,255,255)")
 
     def energyFileChooser(self):
-        file_name = QFileDialog().getOpenFileName(self, "Open energy list", "", "text file (*.txt)")
+        file_name = QFileDialog().getOpenFileName(self, 
+                                                  "Open energy list", 
+                                                  self.user_wd, 
+                                                  "text file (*.txt)")
         self.efilePath = file_name[0]
 
     def fast_xanes_fitting(self):
+
         self._new_window5 = XANESViewer(self.displayedStack, self.xdata, self.refs, self.ref_names)
         self._new_window5.show()
 
@@ -1504,11 +1774,11 @@ class midasWindow(QtWidgets.QMainWindow):
             self,
             "Window Close",
             "Are you sure you want to close?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
 
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             event.accept()
             QApplication.closeAllWindows()
         else:
@@ -1564,50 +1834,6 @@ class Worker(QRunnable):
             self.signals.finished.emit()  # Done
 
 
-class singleStackViewer(QtWidgets.QMainWindow):
-    def __init__(self, img_stack, gradient="viridis"):
-        super(singleStackViewer, self).__init__()
-
-        # Load the UI Page
-        uic.loadUi(os.path.join(ui_path, "uis/singleStackView.ui"), self)
-
-        self.image_view.ui.menuBtn.hide()
-        self.image_view.ui.roiBtn.hide()
-
-        self.img_stack = img_stack
-        self.gradient = gradient
-        self.image_view.setPredefinedGradient(gradient)
-
-        if self.img_stack.ndim == 3:
-            self.dim1, self.dim3, self.dim2 = img_stack.shape
-        elif self.img_stack.ndim == 2:
-            self.dim3, self.dim2 = img_stack.shape
-            self.dim1 = 1
-        self.hs_img_stack.setMaximum(self.dim1 - 1)
-        self.hs_img_stack.setValue(np.round(self.dim1 / 2))
-        self.displayStack()
-
-        # connections
-        self.hs_img_stack.valueChanged.connect(self.displayStack)
-        self.actionSave.triggered.connect(self.saveImageStackAsTIFF)
-
-    def displayStack(self):
-        im_index = self.hs_img_stack.value()
-        if self.img_stack.ndim == 2:
-            self.image_view.setImage(self.img_stack)
-        else:
-            self.image_view.setImage(self.img_stack[im_index])
-        self.label_img_count.setText(f"{im_index + 1}/{self.dim1}")
-
-    def saveImageStackAsTIFF(self):
-        file_name = QFileDialog().getSaveFileName(self, "", "", "*.tiff;;*.tif")
-        if file_name[0]:
-            if self.img_stack.ndim == 3:
-                tf.imsave(str(file_name[0]), np.float32(self.img_stack.transpose(0, 2, 1)))
-            elif self.img_stack.ndim == 2:
-                tf.imsave(str(file_name[0]), np.float32(self.img_stack.T))
-        else:
-            pass
 
 
 class ComponentViewer(QtWidgets.QMainWindow):
@@ -1615,9 +1841,10 @@ class ComponentViewer(QtWidgets.QMainWindow):
         super(ComponentViewer, self).__init__()
 
         # Load the UI Page
-        uic.loadUi(os.path.join(ui_path, "uis/ComponentView.ui"), self)
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
-
+        uic.loadUi(os.path.join(ui_dir, "ComponentView.ui"), self)
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/defaultStyle.css")).read())
+        self.user_wd = os.path.abspath("~")
+       
         self.comp_stack = comp_stack
         self.energy = energy
         self.comp_spectra = comp_spectra
@@ -1639,11 +1866,12 @@ class ComponentViewer(QtWidgets.QMainWindow):
 
         # connection
         self.update_image()
-        self.pb_show_all.clicked.connect(self.show_all_spec)
+        self.pb_show_all.clicked.connect(lambda:self.show_all_spec(norm_to_max = True, add_offset = True))
         self.hs_comp_number.valueChanged.connect(self.update_image)
         self.actionSave.triggered.connect(self.save_comp_data)
         self.pb_openScatterPlot.clicked.connect(self.openScatterPlot)
-        self.pb_showMultiColor.clicked.connect(self.generateMultiColorView)
+        self.pb_showMultiColor.clicked.connect(lambda: self.generateMultiColorView(withSpectra=False))
+        self.pb_showMultiImageXANESView.clicked.connect(lambda: self.generateMultiColorView(withSpectra=True))
 
     def update_image(self):
         im_index = self.hs_comp_number.value()
@@ -1669,45 +1897,80 @@ class ComponentViewer(QtWidgets.QMainWindow):
         # self.scatter_window.setGeometry(px+0.65*pw, py + ph - 2*dh-5, dw, dh)
         self.scatter_window.show()
 
-    def show_all_spec(self):
+    def show_all_spec(self, norm_to_max = True, add_offset = True):
         self.spectrum_view.clear()
         self.plt_colors = ["g", "b", "r", "c", "m", "y", "w"] * 10
         offsets = np.arange(0, 2, 0.2)
         self.spectrum_view.addLegend()
         for ii in range(self.decon_spectra.shape[1]):
+            to_plot = self.decon_spectra[:, ii]
+            if norm_to_max:
+                to_plot = self.decon_spectra[:, ii] / self.decon_spectra[:, ii].max()
+            if add_offset:
+                to_plot = to_plot+ + offsets[ii]
+
             self.spectrum_view.plot(
                 self.energy,
-                (self.decon_spectra[:, ii] / self.decon_spectra[:, ii].max()) + offsets[ii],
+                to_plot,
                 pen=self.plt_colors[ii],
                 name="component" + str(ii + 1),
             )
+        self.component_view.clear()
+        self.component_view.addLegend()
+        for ii in range(self.comp_spectra.shape[1]):
+            to_plot = self.comp_spectra[:, ii]
+            if norm_to_max:
+                to_plot = self.comp_spectra[:, ii] / self.comp_spectra[:, ii].max()
+            if add_offset:
+                to_plot = to_plot+ + offsets[ii]
+            self.component_view.plot(
+                self.energy,
+                to_plot,
+                pen=self.plt_colors[ii],
+                name="eigen_vector" + str(ii + 1),
+            )
 
     def save_comp_data(self):
-        file_name = QFileDialog().getSaveFileName(self, "", "", "data(*tiff *tif *txt *png )")
+        file_name = QFileDialog().getSaveFileName(self, "save all data", self.user_wd, "data(*tiff *tif *txt *png )")
         if file_name[0]:
-            tf.imsave(
-                str(file_name[0]) + "_components.tiff", np.float32(self.comp_stack.transpose(0, 2, 1)), imagej=True
-            )
-            tf.imsave(str(file_name[0]) + "_component_masks.tiff", np.float32(self.decomp_map.T), imagej=True)
-            np.savetxt(str(file_name[0]) + "_deconv_spec.txt", self.decon_spectra)
-            np.savetxt(str(file_name[0]) + "_component_spec.txt", self.comp_spectra)
+            self.show_all_spec(norm_to_max = False, add_offset = False)
+            tf.imwrite(file_name[0] + "_components.tiff", np.float32(self.comp_stack))
+            tf.imwrite(file_name[0] + "_component_masks.tiff", np.float32(self.decomp_map))
+            exporter_spec = pg.exporters.CSVExporter(self.spectrum_view.plotItem)
+            exporter_spec.parameters()["columnMode"] = "(x,y) per plot"
+            exporter_spec.export(file_name[0] + "_deconv_spec.csv")
+            exporter_eigen = pg.exporters.CSVExporter(self.component_view.plotItem)
+            exporter_eigen.parameters()["columnMode"] = "(x,y) per plot"
+            exporter_eigen.export(file_name[0] + "_eigen_vectors.csv")
+            self.user_wd = os.path.dirname(file_name[0])
         else:
             pass
 
-    def generateMultiColorView(self):
+    def generateMultiColorView(self, withSpectra=False):
         self.multichanneldict = {}
 
         for n, (colorName, image) in enumerate(zip(cmap_dict.keys(), self.comp_stack.transpose(0, 1, 2))):
             low, high = np.min(image), np.max(image)
-            self.multichanneldict[f"Image {n + 1}"] = {
-                "ImageName": f"Image {n + 1}",
-                "ImageDir": ".",
-                "Image": image,
-                "Color": colorName,
-                "CmapLimits": (low, high),
-                "Opacity": 1.0,
-            }
-        self.muli_color_window = MultiChannelWindow(image_dict=self.multichanneldict)
+            self.multichanneldict[f'Image {n + 1}'] = {'ImageName': f'Image {n + 1}',
+                                                       'ImageDir': '.',
+                                                       'Image': image,
+                                                       'Color': colorName,
+                                                       'CmapLimits': (low, high),
+                                                       'Opacity': 1.0
+                                                       }
+
+        if withSpectra:
+            compXanesSpetraAll = pd.DataFrame()
+            compXanesSpetraAll['Energy'] = self.energy
+
+            for n, spec in enumerate(self.decon_spectra.T):
+                compXanesSpetraAll[f'Component_{n + 1}'] = spec
+
+            self.muli_color_window = MultiXANESWindow(image_dict=self.multichanneldict,
+                                                      spec_df=compXanesSpetraAll)
+        else:
+            self.muli_color_window = MultiChannelWindow(image_dict=self.multichanneldict)
+
         self.muli_color_window.show()
 
     # add energy column
@@ -1718,8 +1981,9 @@ class ClusterViewer(QtWidgets.QMainWindow):
         super(ClusterViewer, self).__init__()
 
         # Load the UI Page
-        uic.loadUi(os.path.join(ui_path, "uis/ClusterView.ui"), self)
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
+        uic.loadUi(os.path.join(ui_dir, "ClusterView.ui"), self)
+        self.user_wd = os.path.abspath("~")
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/defaultStyle.css")).read())
 
         self.decon_images = decon_images
         self.energy = energy
@@ -1759,11 +2023,12 @@ class ClusterViewer(QtWidgets.QMainWindow):
     def save_clust_data(self):
         file_name = QFileDialog().getSaveFileName(self, "", "", "data(*tiff *tif *txt *png )")
         if file_name[0]:
-            tf.imsave(
-                str(file_name[0]) + "_cluster.tiff", np.float32(self.decon_images.transpose(0, 2, 1)), imagej=True
+
+            tf.imwrite(
+                file_name[0] + "_cluster.tiff", np.float32(self.decon_images.transpose(0, 2, 1)), imagej=True
             )
-            tf.imsave(str(file_name[0]) + "_cluster_map.tiff", np.float32(self.X_cluster.T), imagej=True)
-            np.savetxt(str(file_name[0]) + "_deconv_spec.txt", self.decon_spectra)
+            tf.imwrite(file_name[0] + "_cluster_map.tiff", np.float32(self.X_cluster.T), imagej=True)
+            np.savetxt(file_name[0] + "_deconv_spec.txt", self.decon_spectra)
 
         else:
             logger.error("Saving Cancelled")
@@ -1800,542 +2065,14 @@ class ClusterViewer(QtWidgets.QMainWindow):
         self.muli_color_window.show()
 
 
-class XANESViewer(QtWidgets.QMainWindow):
-    def __init__(self, im_stack=None, e_list=None, refs=None, ref_names=None):
-        super(XANESViewer, self).__init__()
-
-        uic.loadUi(os.path.join(ui_path, "uis/XANESViewer.ui"), self)
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
-
-        self.im_stack = im_stack
-        self.e_list = e_list
-        self.refs = refs
-        self.ref_names = ref_names
-        self.selected = self.ref_names
-        self.fitResultDict = {}
-        self.fit_method = self.cb_xanes_fit_model.currentText()
-        self.alphaForLM = self.dsb_alphaForLM.value()
-
-        self.decon_ims, self.rfactor, self.coeffs_arr = xanes_fitting(
-            self.im_stack, self.e_list, self.refs, method=self.fit_method, alphaForLM=self.alphaForLM
-        )
-
-        (self.dim1, self.dim2, self.dim3) = self.im_stack.shape
-        self.cn = int(self.dim2 // 2)
-        self.sz = np.max([int(self.dim2 * 0.15), int(self.dim3 * 0.15)])
-        self.image_roi = pg.RectROI(
-            [int(self.dim3 // 2), int(self.dim2 // 2)],
-            [self.sz, self.sz],
-            pen="w",
-            maxBounds=QtCore.QRectF(0, 0, self.dim3, self.dim2),
-        )
-
-        self.image_roi.addTranslateHandle([0, 0], [2, 2])
-        self.image_roi.addRotateHandle([0, 1], [2, 2])
-
-        # self.image_roi = pg.PolyLineROI([[0, 0], [0, self.sz], [self.sz, self.sz], [self.sz, 0]],
-        # pos=(int(self.dim2 // 2), int(self.dim3 // 2)),
-        # maxBounds=QtCore.QRect(0, 0, self.dim3, self.dim2), closed=True)
-        # self.image_roi.addTranslateHandle([self.sz // 2, self.sz // 2], [2, 2])
-
-        self.stack_center = int(self.dim1 // 2)
-        self.stack_width = int(self.dim1 * 0.05)
-        # self.image_view.setCurrentIndex(self.stack_center)
-
-        self.image_view.addItem(self.image_roi)
-        self.xdata = self.e_list + self.sb_e_shift.value()
-
-        self.scrollBar_setup()
-        self.display_image_data()
-        self.display_references()
-        self.update_spectrum()
-
-        # connections
-        self.sb_e_shift.valueChanged.connect(self.update_spectrum)
-        self.pb_re_fit.clicked.connect(self.re_fit_xanes)
-        self.pb_edit_refs.clicked.connect(self.choose_refs)
-        self.image_roi.sigRegionChanged.connect(self.update_spectrum)
-        self.hsb_xanes_stk.valueChanged.connect(self.display_image_data)
-        self.hsb_chem_map.valueChanged.connect(self.display_image_data)
-        self.pb_showMultiColor.clicked.connect(self.generateMultiColorView)
-        self.pb_showCompSpec.clicked.connect(self.showComponentXANES)
-
-        # menu
-        self.actionSave_Chem_Map.triggered.connect(self.save_chem_map)
-        self.actionSave_R_factor_Image.triggered.connect(self.save_rfactor_img)
-        self.actionSave_Live_Fit_Data.triggered.connect(self.pg_export_spec_fit)
-        self.actionExport_Fit_Stats.triggered.connect(self.exportFitResults)
-        self.actionExport_Ref_Plot.triggered.connect(self.pg_export_references)
-
-    def scrollBar_setup(self):
-        self.hsb_xanes_stk.setValue(self.stack_center)
-        self.hsb_xanes_stk.setMaximum(self.dim1 - 1)
-        self.hsb_chem_map.setValue(0)
-        self.hsb_chem_map.setMaximum(self.decon_ims.shape[-1] - 1)
-
-    def display_image_data(self):
-        self.image_view.setImage(self.im_stack[self.hsb_xanes_stk.value()])
-        self.image_view.ui.menuBtn.hide()
-        self.image_view.ui.roiBtn.hide()
-        self.image_view.setPredefinedGradient("viridis")
-
-        self.image_view_maps.setImage(self.decon_ims.transpose(2, 0, 1)[self.hsb_chem_map.value()])
-        self.image_view_maps.setPredefinedGradient("bipolar")
-        self.image_view_maps.ui.menuBtn.hide()
-        self.image_view_maps.ui.roiBtn.hide()
-
-    def display_references(self):
-        self.inter_ref = interploate_E(self.refs, self.xdata)
-        self.plt_colors = ["c", "m", "y", "w"] * 10
-        self.spectrum_view_refs.addLegend()
-        for ii in range(self.inter_ref.shape[0]):
-            if len(self.selected) != 0:
-                self.spectrum_view_refs.plot(
-                    self.xdata,
-                    self.inter_ref[ii],
-                    pen=pg.mkPen(self.plt_colors[ii], width=2),
-                    name=self.selected[1:][ii],
-                )
-            else:
-                self.spectrum_view_refs.plot(
-                    self.xdata,
-                    self.inter_ref[ii],
-                    pen=pg.mkPen(self.plt_colors[ii], width=2),
-                    name="ref" + str(ii + 1),
-                )
-
-    def choose_refs(self):
-        "Interactively exclude some standards from the reference file"
-        self.ref_edit_window = RefChooser(
-            self.ref_names,
-            self.im_stack,
-            self.e_list,
-            self.refs,
-            self.sb_e_shift.value(),
-            self.cb_xanes_fit_model.currentText(),
-        )
-        self.ref_edit_window.show()
-        # self.rf_plot = pg.plot(title="RFactor Tracker")
-
-        # connections
-        self.ref_edit_window.choosenRefsSignal.connect(self.update_refs)
-        self.ref_edit_window.fitResultsSignal.connect(self.plotFitResults)
-
-    def update_refs(self, list_):
-        self.selected = list_  # list_ is the signal from ref chooser
-        self.update_spectrum()
-        self.re_fit_xanes()
-
-    def update_spectrum(self):
-        self.roi_img = self.image_roi.getArrayRegion(self.im_stack, self.image_view.imageItem, axes=(1, 2))
-        sizex, sizey = self.roi_img.shape[1], self.roi_img.shape[2]
-        posx, posy = self.image_roi.pos()
-        self.roi_info.setText(f"ROI_Pos: {int(posx)},{int(posy)} ROI_Size: {sizex},{sizey}")
-
-        self.xdata1 = self.e_list + self.sb_e_shift.value()
-        self.ydata1 = get_sum_spectra(self.roi_img)
-        self.fit_method = self.cb_xanes_fit_model.currentText()
-
-        if len(self.selected) != 0:
-            self.inter_ref = interploate_E(self.refs[self.selected], self.xdata1)
-            stats, coeffs = xanes_fitting_1D(
-                self.ydata1,
-                self.xdata1,
-                self.refs[self.selected],
-                method=self.fit_method,
-                alphaForLM=self.alphaForLM,
-            )
-
-        else:
-            self.inter_ref = interploate_E(self.refs, self.xdata1)
-            stats, coeffs = xanes_fitting_1D(
-                self.ydata1, self.xdata1, self.refs, method=self.fit_method, alphaForLM=self.alphaForLM
-            )
-
-        self.fit_ = np.dot(coeffs, self.inter_ref)
-        pen = pg.mkPen("g", width=1.5)
-        pen2 = pg.mkPen("r", width=1.5)
-        # pen3 = pg.mkPen("y", width=1.5)
-        self.spectrum_view.addLegend()
-        self.spectrum_view.setLabel("bottom", "Energy")
-        self.spectrum_view.setLabel("left", "Intensity", "A.U.")
-        self.spectrum_view.plot(self.xdata1, self.ydata1, pen=pen, name="Data", clear=True)
-        self.spectrum_view.plot(self.xdata1, self.fit_, name="Fit", pen=pen2)
-
-        for n, (coff, ref, plt_clr) in enumerate(zip(coeffs, self.inter_ref, self.plt_colors)):
-            if len(self.selected) != 0:
-                self.spectrum_view.plot(self.xdata1, np.dot(coff, ref), name=self.selected[1:][n], pen=plt_clr)
-            else:
-                self.spectrum_view.plot(self.xdata1, np.dot(coff, ref), name="ref" + str(n + 1), pen=plt_clr)
-        # set the rfactor value to the line edit slot
-        self.results = (
-            f"Coefficients: {coeffs} \n"
-            f"R-Factor: {stats['R_Factor']}, R-Square: {stats['R_Square']},\n "
-            f"Chi-Square: {stats['Chi_Square']}, "
-            f"Reduced Chi-Square: {stats['Reduced Chi_Square']}"
-        )
-
-        self.fit_results.setText(self.results)
-
-    def re_fit_xanes(self):
-        if len(self.selected) != 0:
-            self.decon_ims, self.rfactor, self.coeffs_arr = xanes_fitting(
-                self.im_stack,
-                self.e_list + self.sb_e_shift.value(),
-                self.refs[self.selected],
-                method=self.cb_xanes_fit_model.currentText(),
-                alphaForLM=self.alphaForLM,
-            )
-        else:
-            # if non athena file with no header is loaded no ref file cannot be edited
-            self.decon_ims, self.rfactor, self.coeffs_arr = xanes_fitting(
-                self.im_stack,
-                self.e_list + self.sb_e_shift.value(),
-                self.refs,
-                method=self.cb_xanes_fit_model.currentText(),
-                alphaForLM=self.alphaForLM,
-            )
-
-        # rfactor is a list of all spectra so take the mean
-        self.rfactor_mean = np.mean(self.rfactor)
-        self.image_view_maps.setImage(self.decon_ims.transpose(2, 0, 1))
-        self.scrollBar_setup()
-
-    def plotFitResults(self, decon_ims, rfactor_mean, coeff_array):
-        # upadte the chem maps and scrollbar params
-        self.image_view_maps.setImage(decon_ims.transpose(2, 0, 1))
-        # self.hsb_chem_map.setValue(0)
-        # self.hsb_chem_map.setMaximum(decon_ims.shape[-1]-1)
-
-        # set the rfactor value to the line edit slot
-        self.le_r_sq.setText(f"{rfactor_mean :.4f}")
-
-    def showComponentXANES(self):
-        compNum = self.hsb_chem_map.value()
-        currentComp = self.decon_ims.transpose(2, 0, 1)[compNum]
-        currentCompMask = currentComp > 0
-        yData = applyMaskGetMeanSpectrum(self.im_stack, currentCompMask)
-        xanes_comp_plot = pg.plot(
-            self.e_list + self.sb_e_shift.value(),
-            yData,
-            title=f"Component_{compNum}",
-            pen=pg.mkPen("y", width=2, style=QtCore.Qt.DotLine),
-            symbol="o",
-        )
-        xanes_comp_plot.setLabel("bottom", "Energy (keV)")
-        xanes_comp_plot.setLabel("left", "Intensity")
-
-    def generateMultiColorView(self):
-        self.multichanneldict = {}
-
-        for n, (colorName, image) in enumerate(zip(cmap_dict.keys(), self.decon_ims.transpose((2, 0, 1)))):
-            low, high = np.min(image), np.max(image)
-            self.multichanneldict[f"Image {n + 1}"] = {
-                "ImageName": f"Image {n + 1}",
-                "ImageDir": ".",
-                "Image": image,
-                "Color": colorName,
-                "CmapLimits": (low, high),
-                "Opacity": 1.0,
-            }
-        self.muli_color_window = MultiChannelWindow(image_dict=self.multichanneldict)
-        self.muli_color_window.show()
-
-    def save_chem_map(self):
-        file_name = QFileDialog().getSaveFileName(self, "save image", "chemical_map.tiff", "image data (*tiff)")
-        if file_name[0]:
-            tf.imsave(str(file_name[0]), np.float32(self.decon_ims.transpose(2, 0, 1)), imagej=True)
-        else:
-            logger.error("No file to save")
-            pass
-
-    def save_rfactor_img(self):
-        file_name = QFileDialog().getSaveFileName(self, "save image", "r-factor_map.tiff", "image data (*tiff)")
-        if file_name[0]:
-            tf.imsave(str(file_name[0]), np.float32(self.rfactor), imagej=True)
-        else:
-            logger.error("No file to save")
-            pass
-
-    def save_spec_fit(self):
-        try:
-            to_save = np.column_stack([self.xdata1, self.ydata1, self.fit_])
-            file_name = QFileDialog().getSaveFileName(self, "save spectrum", "", "spectrum and fit (*txt)")
-            if file_name[0]:
-                np.savetxt(str(file_name[0]) + ".txt", to_save)
-            else:
-                pass
-        except Exception:
-            logger.error("No file to save")
-            pass
-
-    def pg_export_spec_fit(self):
-        exporter = pg.exporters.CSVExporter(self.spectrum_view.plotItem)
-        exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
-        file_name = QFileDialog().getSaveFileName(self, "save spectrum", "", "spectrum and fit (*csv)")
-        if file_name[0]:
-            exporter.export(str(file_name[0]) + ".csv")
-        else:
-            pass
-
-    def pg_export_references(self):
-        exporter = pg.exporters.CSVExporter(self.spectrum_view_refs.plotItem)
-        exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
-        file_name = QFileDialog().getSaveFileName(
-            self, "save references", "xanes_references.csv", "column data (*csv)"
-        )
-        if file_name[0]:
-            exporter.export(str(file_name[0]))
-        else:
-            pass
-
-    def exportFitResults(self):
-        file_name = QFileDialog().getSaveFileName(self, "save txt", "xanes_1D_fit_results.txt", "txt data (*txt)")
-        if file_name[0]:
-            with open(file_name[0], "w") as file:
-                file.write(self.results)
-        else:
-            pass
-
-
-class RefChooser(QtWidgets.QMainWindow):
-    choosenRefsSignal: pyqtSignal = QtCore.pyqtSignal(list)
-    fitResultsSignal: pyqtSignal = QtCore.pyqtSignal(np.ndarray, float, np.ndarray)
-
-    def __init__(self, ref_names, im_stack, e_list, refs, e_shift, fit_model):
-        super(RefChooser, self).__init__()
-        uic.loadUi(os.path.join(ui_path, "uis/RefChooser.ui"), self)
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
-        self.ref_names = ref_names
-        self.refs = refs
-        self.im_stack = im_stack
-        self.e_list = e_list
-        self.e_shift = e_shift
-        self.fit_model = fit_model
-
-        self.all_boxes = []
-        self.rFactorList = []
-
-        self.displayCombinations()
-
-        # selection become more apparent than default with red-ish color
-        self.tableWidget.setStyleSheet("background-color: white; selection-background-color: rgb(200,0,0);")
-
-        # add a line to the plot to walk through the table. Note that the table is not sorted
-        self.selectionLine = pg.InfiniteLine(
-            pos=1, angle=90, pen=pg.mkPen("m", width=2.5), movable=True, bounds=None, label="Move Me!"
-        )
-        self.stat_view.setLabel("bottom", "Fit ID")
-        self.stat_view.setLabel("left", "Reduced Chi^2")
-
-        for n, i in enumerate(self.ref_names):
-            self.cb_i = QtWidgets.QCheckBox(self.ref_box_frame)
-            if n == 0:
-                self.cb_i.setChecked(True)
-                self.cb_i.setEnabled(False)
-            self.cb_i.setObjectName(i)
-            self.cb_i.setText(i)
-            self.gridLayout_2.addWidget(self.cb_i, n, 0, 1, 1)
-            self.cb_i.toggled.connect(self.enableApply)
-            self.all_boxes.append(self.cb_i)
-
-        # connections
-        self.pb_apply.clicked.connect(self.clickedWhichAre)
-        self.pb_combo.clicked.connect(self.tryAllCombo)
-        self.actionExport_Results_csv.triggered.connect(self.exportFitResults)
-        self.selectionLine.sigPositionChanged.connect(self.updateFitWithLine)
-        self.tableWidget.itemSelectionChanged.connect(self.updateWithTableSelection)
-        # self.stat_view.scene().sigMouseClicked.connect(self.moveSelectionLine)
-        self.stat_view.mouseDoubleClickEvent = self.moveSelectionLine
-        self.sb_max_combo.valueChanged.connect(self.displayCombinations)
-        # self.pb_sort_with_r.clicked.connect(lambda: self.tableWidget.sortItems(3, QtCore.Qt.AscendingOrder))
-        self.pb_sort_with_r.clicked.connect(self.sortTable)
-        self.cb_sorter.currentTextChanged.connect(self.sortTable)
-
-    # def clickedWhich(self):
-    #     button_name = self.sender()
-
-    def populateChecked(self):
-        self.onlyCheckedBoxes = []
-        for names in self.all_boxes:
-            if names.isChecked():
-                self.onlyCheckedBoxes.append(names.objectName())
-
-    QtCore.pyqtSlot()
-
-    def clickedWhichAre(self):
-        self.populateChecked()
-        self.choosenRefsSignal.emit(self.onlyCheckedBoxes)
-
-    def generateRefList(self, ref_list, maxCombo, minCombo=1):
-        """
-        Creates a list of reference combinations for xanes fitting
-
-        Paramaters;
-
-        ref_list (list): list of ref names from the header
-        maxCombo (int): maximum number of ref lists in combination
-        minCombo (int): min number of ref lists in combination
-
-        returns;
-
-        1. int: length of total number of combinations
-        2. list: all the combinations
-
-        """
-
-        if not maxCombo > len(ref_list):
-            iter_list = []
-            while minCombo < maxCombo + 1:
-                iter_list += list(combinations(ref_list, minCombo))
-                minCombo += 1
-            return len(iter_list), iter_list
-
-        else:
-            raise ValueError(" Maximum numbinations cannot be larger than number of list items")
-
-    def displayCombinations(self):
-        niter, self.iter_list = self.generateRefList(self.ref_names[1:], self.sb_max_combo.value())
-        self.label_nComb.setText(str(niter) + " Combinations")
-
-    @QtCore.pyqtSlot()
-    def tryAllCombo(self):
-        # empty list to to keep track and plot of reduced chi2 of all the fits
-        self.rfactor_list = []
-
-        # create dataframe for the table
-        self.df = pd.DataFrame(
-            columns=["Fit Number", "References", "Coefficients", "R-Factor", "R^2", "chi^2", "red-chi^2", "Score"]
-        )
-
-        # df columns is the header for the table widget
-        self.tableWidget.setHorizontalHeaderLabels(self.df.columns)
-        # self.iter_list = list(combinations(self.ref_names[1:],self.sb_max_combo.value()))
-
-        niter, self.iter_list = self.generateRefList(self.ref_names[1:], self.sb_max_combo.value())
-        tot_combo = len(self.iter_list)
-        for n, refs in enumerate(self.iter_list):
-            self.statusbar.showMessage(f"{n + 1}/{tot_combo}")
-            selectedRefs = list((str(self.ref_names[0]),) + refs)
-            self.fit_combo_progress.setValue((n + 1) * 100 / tot_combo)
-            self.stat, self.coeffs_arr = xanes_fitting_Binned(
-                self.im_stack, self.e_list + self.e_shift, self.refs[selectedRefs], method=self.fit_model
-            )
-
-            self.rfactor_list.append(self.stat["Reduced Chi_Square"])
-            self.stat_view.plot(
-                x=np.arange(n + 1),
-                y=self.rfactor_list,
-                clear=True,
-                title="Reduced Chi^2",
-                pen=pg.mkPen("y", width=2, style=QtCore.Qt.DotLine),
-                symbol="o",
-            )
-
-            # arbitary number to rank the best fit
-            fit_score = (self.stat["R_Square"] + np.sum(self.coeffs_arr)) / (
-                self.stat["R_Factor"] + self.stat["Reduced Chi_Square"]
-            )
-
-            resultsDict = {
-                "Fit Number": n,
-                "References": str(selectedRefs[1:]),
-                "Coefficients": str(np.around(self.coeffs_arr, 4)),
-                "Sum of Coefficients": str(np.around(np.sum(self.coeffs_arr), 4)),
-                "R-Factor": self.stat["R_Factor"],
-                "R^2": self.stat["R_Square"],
-                "chi^2": self.stat["Chi_Square"],
-                "red-chi^2": self.stat["Reduced Chi_Square"],
-                "Score": np.around(fit_score, 4),
-            }
-
-            self.df = pd.concat([self.df, pd.DataFrame([resultsDict])], ignore_index=True)
-
-            self.dataFrametoQTable(self.df)
-            QtTest.QTest.qWait(0.1)  # hepls with real time plotting
-
-        self.stat_view.addItem(self.selectionLine)
-
-    def dataFrametoQTable(self, df_: pd.DataFrame):
-        nRows = len(df_.index)
-        nColumns = len(df_.columns)
-        self.tableWidget.setRowCount(nRows)
-        self.tableWidget.setColumnCount(nColumns)
-        self.tableWidget.setHorizontalHeaderLabels(df_.columns)
-
-        for i in range(nRows):
-            for j in range(nColumns):
-                cell = QtWidgets.QTableWidgetItem(str(df_.values[i][j]))
-                self.tableWidget.setItem(i, j, cell)
-
-        # set the property of the table view. Size policy to make the contents justified
-        self.tableWidget.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
-        self.tableWidget.resizeColumnsToContents()
-
-    def exportFitResults(self):
-        file_name = QFileDialog().getSaveFileName(self, "save csv", "xanes_fit_results_log.csv", "txt data (*csv)")
-        if file_name[0]:
-            with open(str(file_name[0]), "w") as fp:
-                self.df.to_csv(fp)
-        else:
-            pass
-
-    def selectTableAndCheckBox(self, x):
-        nSelection = int(round(x))
-        self.tableWidget.selectRow(nSelection)
-        fit_num = int(self.tableWidget.item(nSelection, 0).text())
-        refs_selected = self.iter_list[fit_num]
-
-        # reset all the checkboxes to uncheck state, except the energy
-        for checkstate in self.findChildren(QtWidgets.QCheckBox):
-            if checkstate.isEnabled():
-                checkstate.setChecked(False)
-
-        for cb_names in refs_selected:
-            checkbox = self.findChild(QtWidgets.QCheckBox, name=cb_names)
-            checkbox.setChecked(True)
-
-    def updateFitWithLine(self):
-        pos_x, pos_y = self.selectionLine.pos()
-        x = self.df.index[self.df[str("Fit Number")] == np.round(pos_x)][0]
-        self.selectTableAndCheckBox(x)
-
-    def updateWithTableSelection(self):
-        x = self.tableWidget.currentRow()
-        self.selectTableAndCheckBox(x)
-
-    def moveSelectionLine(self, event):
-        if event.button() == QtCore.Qt.LeftButton:
-            Pos = self.stat_view.plotItem.vb.mapSceneToView(event.pos())
-            self.selectionLine.setPos(Pos.x())
-
-    def sortTable(self):
-        sorter_dict = {
-            "R-Factor": "R-Factor",
-            "R-Square": "R^2",
-            "Chi-Square": "chi^2",
-            "Reduced Chi-Square": "red-chi^2",
-            "Fit Number": "Fit Number",
-        }
-        sorter = sorter_dict[self.cb_sorter.currentText()]
-        self.df = self.df.sort_values(sorter, ignore_index=True)
-        self.dataFrametoQTable(self.df)
-
-    def enableApply(self):
-        """ """
-        self.populateChecked()
-        if len(self.onlyCheckedBoxes) > 1:
-            self.pb_apply.setEnabled(True)
-        else:
-            self.pb_apply.setEnabled(False)
-
 
 class ScatterPlot(QtWidgets.QMainWindow):
     def __init__(self, img1, img2, nameTuple):
         super(ScatterPlot, self).__init__()
 
-        uic.loadUi(os.path.join(ui_path, "uis/ScatterView.ui"), self)
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
+        uic.loadUi(os.path.join(ui_dir, "ScatterView.ui"), self)
+        self.user_wd = os.path.abspath("~")
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/defaultStyle.css")).read())
         self.clearPgPlot()
         self.w1 = self.scatterViewer.addPlot()
         self.img1 = img1
@@ -2426,24 +2163,34 @@ class ScatterPlot(QtWidgets.QMainWindow):
         [rbs.clicked.connect(self.updateROIDict) for rbs in [self.rb_roi1, self.rb_roi2, self.rb_roi3]]
 
     def pg_export_correlation(self):
+
         exporter = pg.exporters.CSVExporter(self.w1)
-        exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
-        file_name = QFileDialog().getSaveFileName(self, "save correlation", "", "spectrum and fit (*csv)")
+        #exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
+        file_name = QFileDialog().getSaveFileName(self, 
+                                                  "save correlation", 
+                                                  os.path.join(self.user_wd,"correlation.csv"), 
+                                                  "spectrum and fit (*csv)")
         if file_name[0]:
-            exporter.export(str(file_name[0]) + ".csv")
-            self.statusbar.showMessage(f"Data saved to {str(file_name[0])}")
+            exporter.export(file_name[0] + ".csv")
+            self.statusbar.showMessage(f"Data saved to {file_name[0]}")
+            self.user_wd = os.path.dirname(file_name[0])
         else:
             pass
 
     def tiff_export_images(self):
-        file_name = QFileDialog().getSaveFileName(self, "save images", "", "spectrum and fit (*tiff)")
+        file_name = QFileDialog().getSaveFileName(self, 
+                                                  "save images", 
+                                                  os.path.join(self.user_wd,"image.txt"), 
+                                                  "spectrum and fit (*tiff)")
         if file_name[0]:
-            tf.imsave(str(file_name[0]) + ".tiff", np.dstack([self.img1, self.img2]).T)
-            self.statusbar.showMessage(f"Images saved to {str(file_name[0])}")
+            tf.imwrite(file_name[0] + ".tiff", np.dstack([self.img1, self.img2]).T)
+            self.statusbar.showMessage(f"Images saved to {file_name[0]}")
+            self.user_wd = os.path.dirname(file_name[0])
         else:
             pass
 
     def createMask(self, ROIName):
+
         try:
             self.w1.removeItem(ROIName)
         except Exception:
@@ -2460,6 +2207,7 @@ class ScatterPlot(QtWidgets.QMainWindow):
             pass
 
     def getMaskRegion(self, ROIName, generateSeperateWindows=True):
+
         """filter scatterplot points using polylineROI region"""
 
         # Ref : https://stackoverflow.com/questions/57719303/how-to-map-mouse-position-on-a-scatterplot
@@ -2493,11 +2241,11 @@ class ScatterPlot(QtWidgets.QMainWindow):
 
         # Prepare strings for fit results and stats
         self.fitLineEqn = (
-            f" y =  x*{result.slope :.3e} + {result.intercept :.3e}, "
-            "R^2 = {result.rvalue**2 :.3f}, r = {pr :.3f}\n"
+            f" y =  x*{result.slope :.3e} + {result.intercept :.3e},"
+            f"\n R^2 = {result.rvalue**2 :.3f}, r = {pr :.3f}"
         )
         FitStats1 = f" Slope Error = {result.stderr :.3e}, Intercept Error = {result.intercept_stderr :.3e}\n"
-        FitStats2 = f" Pearson’s correlation coefficient = {pr :.3f}"
+        FitStats2 = f" Pearson's correlation coefficient = {pr :.3f}"
         refs = "\n\n ***References****\n\n scipy.stats.linregress, scipy.stats.pearsonr "
         fitStats = (
             f"\n ***{ROIName} Fit Results***\n\n" + " Equation: " + self.fitLineEqn + FitStats1 + FitStats2 + refs
@@ -2557,6 +2305,7 @@ class ScatterPlot(QtWidgets.QMainWindow):
                 pass
 
     def createCompositeScatter(self):
+
         points = []
         fitLine = []
         masks = []
@@ -2573,12 +2322,13 @@ class ScatterPlot(QtWidgets.QMainWindow):
             else:
                 pass
 
-        logger.info(f" fitline shape: {np.shape(fitLine)}")
-        logger.info(f" points shape: {np.shape(points)}")
-        logger.info(f" maks shape: {np.shape(masks)}")
         self.compositeScatterWindow = CompositeScatterPlot(
-            np.array(points), np.array(fitLine), np.array(masks), roiFitEqn, self.nameTuple
-        )
+                                                            points,
+                                                            fitLine, 
+                                                            np.array(masks), 
+                                                            roiFitEqn, 
+                                                            self.nameTuple
+                                                        )
         self.compositeScatterWindow.show()
 
     def _createCompositeScatter(self):
@@ -2592,6 +2342,7 @@ class ScatterPlot(QtWidgets.QMainWindow):
                 self.getMaskRegion(key, generateSeperateWindows=False)
 
                 for x, y, yy in zip(self.xData, self.yData, self.yyData):
+
                     points.append(
                         {
                             "pos": (x, y),
@@ -2612,13 +2363,13 @@ class ScatterPlot(QtWidgets.QMainWindow):
     def getROIParams(self):
         print(np.array(self.scatter_mask.getSceneHandlePositions()))
 
-
 class MaskedScatterPlotFit(QtWidgets.QMainWindow):
     def __init__(self, scatterData, fitData, mask, maskedImage, fitString, fitEquation, nameTuple):
         super(MaskedScatterPlotFit, self).__init__()
 
-        uic.loadUi(os.path.join(ui_path, "uis/maskedScatterPlotFit.ui"), self)
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
+        uic.loadUi(os.path.join(ui_dir, "maskedScatterPlotFit.ui"), self)
+        self.user_wd = os.path.abspath("~")
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/defaultStyle.css")).read())
         self.scatterData = scatterData
         self.fitData = fitData
         self.mask = mask
@@ -2692,42 +2443,45 @@ class MaskedScatterPlotFit(QtWidgets.QMainWindow):
         self.statusbar.showMessage("text copied to clipboard")
 
     def pg_export_correlation(self):
+
         exporter = pg.exporters.CSVExporter(self.canvas)
-        exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
+        #exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
         file_name = QFileDialog().getSaveFileName(
             self, "save correlation", "scatterData.csv", "spectrum and fit (*csv)"
         )
         if file_name[0]:
-            exporter.export(str(file_name[0]))
-            self.statusbar.showMessage(f"Data saved to {str(file_name[0])}")
+            exporter.export(file_name[0])
+            self.statusbar.showMessage(f"Data saved to {file_name[0]}")
         else:
             pass
 
     def saveImage(self):
+
         file_name = QFileDialog().getSaveFileName(self, "Save image data", "image.tiff", "image file(*tiff *tif )")
         if file_name[0]:
-            tf.imsave(str(file_name[0]), self.maskedImage)
-            self.statusbar.showMessage(f"Data saved to {str(file_name[0])}")
+            tf.imwrite(file_name[0], self.maskedImage)
+            self.statusbar.showMessage(f"Data saved to {file_name[0]}")
         else:
             self.statusbar.showMessage("Saving cancelled")
             pass
 
     def saveMask(self):
+
         file_name = QFileDialog().getSaveFileName(self, "Save image data", "mask.tiff", "image file(*tiff *tif )")
         if file_name[0]:
-            tf.imsave(str(file_name[0]), self.mask)
-            self.statusbar.showMessage(f"Data saved to {str(file_name[0])}")
+            tf.imwrite(file_name[0], self.mask)
+            self.statusbar.showMessage(f"Data saved to {file_name[0]}")
         else:
             self.statusbar.showMessage("Saving cancelled")
             pass
-
 
 class ComponentScatterPlot(QtWidgets.QMainWindow):
     def __init__(self, decomp_stack, specs):
         super(ComponentScatterPlot, self).__init__()
 
-        uic.loadUi(os.path.join(ui_path, "uis/ComponentScatterPlot.ui"), self)
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
+        uic.loadUi(os.path.join(ui_dir, "ComponentScatterPlot.ui"), self)
+        self.user_wd = os.path.abspath("~")
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/defaultStyle.css")).read())
         self.w1 = self.scatterViewer.addPlot()
         self.decomp_stack = decomp_stack
         self.specs = specs
@@ -2750,6 +2504,7 @@ class ComponentScatterPlot(QtWidgets.QMainWindow):
         self.pb_addALine.clicked.connect(lambda: self.createMask(Line=True))
 
     def setImageAndScatterPlot(self):
+
         try:
             self.s1.clear()
         except Exception:
@@ -2769,6 +2524,7 @@ class ComponentScatterPlot(QtWidgets.QMainWindow):
 
         points = []
         for i, j in zip(self.img1.flatten(), self.img2.flatten()):
+
             points.append(
                 {
                     "pos": (i, j),
@@ -2788,6 +2544,7 @@ class ComponentScatterPlot(QtWidgets.QMainWindow):
         self.label_im2.setText(f"PC{comp_tuple[-1]+1}")
 
     def createMask(self, Line=False):
+
         self.size = self.img1.max() / 10
         self.pos = int(self.img1.mean())
 
@@ -2802,6 +2559,7 @@ class ComponentScatterPlot(QtWidgets.QMainWindow):
             self.w1.addItem(self.lineROI)
 
         else:
+
             self.scatter_mask = pg.PolyLineROI(
                 [[0, 0], [0, self.size], [self.size, self.size], [self.size, 0]],
                 pos=(self.pos, self.pos),
@@ -2830,6 +2588,7 @@ class ComponentScatterPlot(QtWidgets.QMainWindow):
             pass
 
     def getMaskRegion(self):
+
         # Ref : https://stackoverflow.com/questions/57719303/how-to-map-mouse-position-on-a-scatterplot
 
         roiShape = self.scatter_mask.mapToItem(self.s1, self.scatter_mask.shape())
@@ -2845,28 +2604,28 @@ class ComponentScatterPlot(QtWidgets.QMainWindow):
         self.masked_img.show()
 
     def pg_export_correlation(self):
+
         exporter = pg.exporters.CSVExporter(self.w1)
         exporter.parameters()["columnMode"] = "(x,y,y,y) for all plots"
         file_name = QFileDialog().getSaveFileName(self, "save correlation", "", "spectrum and fit (*csv)")
         if file_name[0]:
-            exporter.export(str(file_name[0]) + ".csv")
-            self.statusbar.showMessage(f"Data saved to {str(file_name[0])}")
+            exporter.export(file_name[0] + ".csv")
+            self.statusbar.showMessage(f"Data saved to {file_name[0]}")
         else:
             pass
 
     def tiff_export_images(self):
         file_name = QFileDialog().getSaveFileName(self, "save images", "", "spectrum and fit (*tiff)")
         if file_name[0]:
-            tf.imsave(str(file_name[0]) + ".tiff", np.dstack([self.img1, self.img2]).T)
-            self.statusbar.showMessage(f"Images saved to {str(file_name[0])}")
+            tf.imwrite(file_name[0] + ".tiff", np.dstack([self.img1, self.img2]).T)
+            self.statusbar.showMessage(f"Images saved to {file_name[0]}")
         else:
             pass
-
 
 class LoadingScreen(QtWidgets.QSplashScreen):
     def __init__(self):
         super(LoadingScreen, self).__init__()
-        uic.loadUi(os.path.join(ui_path, "uis/animationWindow.ui"), self)
+        uic.loadUi(os.path.join(ui_dir, "animationWindow.ui"), self)
         self.setWindowOpacity(0.65)
         self.movie = QMovie("uis/animation.gif")
         self.label.setMovie(self.movie)
@@ -2883,20 +2642,24 @@ class LoadingScreen(QtWidgets.QSplashScreen):
         self.movie.stop()
         self.hide()
 
-
 class CompositeScatterPlot(QtWidgets.QMainWindow):
     def __init__(self, scatterPoints, fitLine, maskImages, fitEquations, nameTuple):
         super(CompositeScatterPlot, self).__init__()
 
-        uic.loadUi(os.path.join(ui_path, "uis/multipleScatterFit.ui"), self)
-        self.centralwidget.setStyleSheet(open(os.path.join(ui_path, "css/defaultStyle.css")).read())
+        uic.loadUi(os.path.join(ui_dir, "multipleScatterFit.ui"), self)
+        self.user_wd = os.path.abspath("~")
+        self.centralwidget.setStyleSheet(open(os.path.join(ui_dir, "css/defaultStyle.css")).read())
 
         self.scatterPoints = scatterPoints
+        # print(f"{np.shape(self.scatterPoints) = }")
         self.fitLine = fitLine
+        #print(f"{np.shape(self.fitLine) = }")
         self.scatterColors = ["r", (0, 115, 0), (4, 186, 186), "c", "w", "k"]
         self.fitColors = ["b", "r", "m", "k", "b"]
         self.roiNames = list(fitEquations.keys())
         self.fitEqns = list(fitEquations.values())
+        # print(f"{np.shape(self.roiNames) = }")
+        # print(f"{np.shape(self.fitEqns) = }")
         self.nameTuple = nameTuple
         self.maskImages = maskImages
 
@@ -2915,9 +2678,11 @@ class CompositeScatterPlot(QtWidgets.QMainWindow):
         self.actionBlack.triggered.connect(lambda: self.scatterViewer.setBackground("k"))
 
         with pg.BusyCursor():
+
             for arr, fitline, clr, fitClr, rname, feqn in zip(
                 self.scatterPoints, self.fitLine, self.scatterColors, self.fitColors, self.roiNames, self.fitEqns
             ):
+
                 sctrPoints = []
                 for pt in arr:
                     sctrPoints.append(
@@ -2927,7 +2692,7 @@ class CompositeScatterPlot(QtWidgets.QMainWindow):
                 # generate a scatter plot item
                 self.scattered = pg.ScatterPlotItem(size=4.5, pen=clr, brush=pg.mkBrush(5, 214, 255, 200))
                 # set scatter plot data
-                self.scattered.setPoints(sctrPoints, name=rname)
+                self.scattered.addPoints(sctrPoints, name=rname)
 
                 # set z value negative to show scatter data behind the fit line
                 self.scattered.setZValue(-10)
@@ -2963,164 +2728,41 @@ class CompositeScatterPlot(QtWidgets.QMainWindow):
         self.muli_color_window.show()
 
     def exportData(self):
+
         exporter = pg.exporters.CSVExporter(self.canvas)
         # exporter.parameters()['columnMode'] = '(x,y,y,y) for all plots'
-        file_name = QFileDialog().getSaveFileName(self, "Save CSV Data", "scatter.csv", "image file (*csv)")
+        file_name = QFileDialog().getSaveFileName(self, 
+                                                  "Save CSV Data", 
+                                                  os.path.join(self.user_wd,"scatter.csv"), 
+                                                  "image file (*csv)")
         if file_name[0]:
-            exporter.export(str(file_name[0]))
-            self.statusbar.showMessage(f"Data saved to {str(file_name[0])}")
+            exporter.export(file_name[0])
+            self.statusbar.showMessage(f"Data saved to {file_name[0]}")
+            self.user_wd = os.path.dirname(file_name[0])
         else:
             pass
 
     def exportAsPNG(self):
-        file_name = QtWidgets.QFileDialog().getSaveFileName(
-            self, "Save Image", "image.png", "PNG(*.png);; TIFF(*.tiff);; JPG(*.jpg)"
+        file_name = QFileDialog().getSaveFileName(self, 
+                                                 "Save Image", 
+                                                 os.path.join(self.user_wd,"image.png"),
+                                                 "PNG(*.png);; TIFF(*.tiff);; JPG(*.jpg)"
         )
         exporter = pg.exporters.ImageExporter(self.canvas)
 
         if file_name[0]:
-            exporter.export(str(file_name[0]))
-            self.statusbar.showMessage(f"Image saved to {str(file_name[0])}")
+            exporter.export(file_name[0])
+            self.statusbar.showMessage(f"Image saved to {file_name[0]}")
+            self.user_wd = os.path.dirname(file_name[0])
         else:
-            pass
-
-
-class MaskSpecViewer(QtWidgets.QMainWindow):
-    def __init__(self, xanes_stack=None, xrf_map=None, energy=[]):
-        super(MaskSpecViewer, self).__init__()
-        uic.loadUi(os.path.join(ui_path, "uis/MaskedView.ui"), self)
-
-        self.xanes_stack = xanes_stack
-        self.xrf_map = xrf_map
-        self.energy = energy
-        self.xrf_map = self.xanes_stack[-1]
-        self.view_data()
-
-        # connections
-        self.sldr_xrf_low.valueChanged.connect(self.create_mask)
-        self.sldr_xrf_high.valueChanged.connect(self.create_mask)
-        self.pb_apply_mask.clicked.connect(self.apply_mask_to_xanes)
-        self.pb_export_mask.clicked.connect(self.export_mask)
-        self.pb_import_mask.clicked.connect(self.import_a_mask)
-        self.actionLoad_Energy_List.triggered.connect(self.load_energy)
-        self.actionLoad_XANES_Stack.triggered.connect(self.load_xanes_stack)
-        self.actionLoad_XRF_Map.triggered.connect(self.load_xrf_map)
-
-    def view_data(self):
-        self.xanes_view.setImage(self.xanes_stack)
-        self.xanes_view.ui.menuBtn.hide()
-        self.xanes_view.ui.roiBtn.hide()
-        (self.dim1, self.dim3, self.dim2) = self.xanes_stack.shape
-        self.xanes_view.setPredefinedGradient("viridis")
-        self.xanes_view.setCurrentIndex(self.dim1 // 2)
-        self.statusbar.showMessage("One image from the XANES stack is used as mask")
-        self.xrf_view.setImage(self.xrf_map)
-        self.xrf_view.ui.menuBtn.hide()
-        self.xrf_view.ui.roiBtn.hide()
-        self.xrf_view.setPredefinedGradient("viridis")
-
-        self.mask_view.ui.menuBtn.hide()
-        self.mask_view.ui.roiBtn.hide()
-
-    def create_mask(self):
-        self.threshold_low = np.around(self.sldr_xrf_low.value() * 0.01, 3)
-        self.threshold_high = np.around(self.sldr_xrf_high.value() * 0.01, 3)
-        self.sldr_xrf_low.setMaximum(self.sldr_xrf_high.value() + 1)
-        self.sldr_xrf_high.setMinimum(self.sldr_xrf_low.value() + 1)
-        self.norm_xrf_map = remove_nan_inf(self.xrf_map) / remove_nan_inf(self.xrf_map.max())
-        self.norm_xrf_map[self.norm_xrf_map < self.threshold_low] = 0
-        self.norm_xrf_map[self.norm_xrf_map > self.threshold_high] = 0
-        self.xrf_view.setImage(self.norm_xrf_map)
-        self.le_sldr_vals.setText(str(self.threshold_low) + " to " + str(self.threshold_high))
-        self.statusbar.showMessage("New Threshold Applied")
-        self.xrf_mask = np.where(self.norm_xrf_map > 0, self.norm_xrf_map, 0)
-        self.xrf_mask[self.xrf_mask > 0] = 1
-        self.mask_view.setImage(self.xrf_mask)
-
-    def load_xanes_stack(self):
-        """loading a new xanes stack"""
-        filename = QFileDialog().getOpenFileName(self, "Select image data", "", "image file(*tiff *tif )")
-        self.file_name = str(filename[0])
-        self.xanes_stack = tf.imread(self.file_name).transpose(0, 2, 1)
-        self.view_data()
-
-    def load_energy(self):
-        """To load energy list that will be used for plotting the spectra.
-        number of stack should match length of energy list"""
-
-        file_name = QFileDialog().getOpenFileName(self, "Open energy list", "", "text file (*.txt)")
-
-        try:
-            self.energy = np.loadtxt(str(file_name[0]))
-            logger.info("Energy file loaded")
-            assert len(self.energy) == self.dim1
-            self.view_data()
-
-        except OSError:
-            logger.error("No File selected")
-            pass
-
-    def load_xrf_map(self):
-        """To xrf map for masking. If 3D mean will be taken"""
-
-        filename = QFileDialog().getOpenFileName(self, "Select image data", "", "image file(*tiff *tif )")
-        self.xrf_file_name = str(filename[0])
-        self.xrf_map = tf.imread(self.xrf_file_name)
-        if self.xrf_map.ndim == 3:
-            self.xrf_map = self.xrf_map.mean(0).T
-
-        else:
-            self.xrf_map = self.xrf_map.T
-
-        assert (
-            self.dim3,
-            self.dim2,
-        ) == self.xrf_map.shape, f"Unexpected image dimensions: {self.xrf_map.shape} vs {(self.dim2,self.dim3)}"
-
-        self.view_data()
-        self.create_mask()
-
-    def apply_mask_to_xanes(self):
-        """Generates a mask with 0 and 1 from the choosen threshold and multply with the xanes stack.
-        A spectrum will be generated from the new masked stack"""
-
-        self.masked_xanes = self.xanes_stack * self.xrf_mask
-        self.xanes_view.setImage(self.masked_xanes)
-        self.xanes_view.setCurrentIndex(self.dim1 // 2)
-        self.statusbar.showMessage("Mask Applied to XANES")
-        self.mask_spec = get_mean_spectra(self.masked_xanes)
-
-        if len(self.energy) != 0:
-            self.xdata = self.energy
-        else:
-            self.xdata = np.arange(0, self.dim1)
-            self.statusbar.showMessage("No Energy List Available; Integer values are used for plotting")
-
-        self.spectrum_view.plot(self.xdata, self.mask_spec, clear=True)
-
-    def import_a_mask(self):
-        filename = QFileDialog().getOpenFileName(self, "Select image data", "", "image file(*tiff *tif )")
-        xrf_file_name = str(filename[0])
-        self.xrf_mask = tf.imread(xrf_file_name).T
-        self.statusbar.showMessage("A New Mask Imported")
-        self.mask_view.setImage(self.xrf_mask)
-        self.apply_mask_to_xanes()
-
-    def export_mask(self):
-        try:
-            file_name = QFileDialog().getSaveFileName(self, "Save image data", "", "image file(*tiff *tif )")
-            tf.imsave(str(file_name[0]) + ".tiff", self.xrf_mask.T)
-            logger.info(f"Updated Image Saved: {str(file_name[0])}")
-            self.statusbar.showMessage("Mask Exported")
-        except Exception:
-            logger.error("No file to save")
             pass
 
 
 class StackInfo(QtWidgets.QMainWindow):
     def __init__(self, text_to_write: str = " "):
         super(StackInfo, self).__init__()
-        uic.loadUi(os.path.join(ui_path, "uis/log.ui"), self)
+        uic.loadUi(os.path.join(ui_dir, "log.ui"), self)
+        self.user_wd = os.path.abspath("~")
 
         self.text_to_write = text_to_write
         self.pte_run_cmd.setPlainText(self.text_to_write)
@@ -3141,1059 +2783,17 @@ class StackInfo(QtWidgets.QMainWindow):
         self.pte_run_cmd.clear()
 
 
-class MultiChannelWindow(QtWidgets.QMainWindow):
-    def __init__(self, image_dict=None):
-        super(MultiChannelWindow, self).__init__()
-        if image_dict is None:
-            image_dict = {}
-        uic.loadUi(os.path.join(ui_path, "uis/mutlichannel.ui"), self)
-
-        self.canvas = self.img_view.addPlot(title="")
-        self.canvas.getViewBox().invertY(True)
-        self.canvas.setAspectLocked(True)
-        self.cb_choose_color.addItems([i for i in cmap_dict.keys()])
-
-        self.image_dict = image_dict
-        self.buildFromDictionary()
-
-        # connections
-        self.actionLoad.triggered.connect(self.createMuliColorAndList)
-        self.actionLoad_Stack.triggered.connect(self.createMuliColorAndList)
-        self.cb_choose_color.currentTextChanged.connect(self.updateImageDictionary)
-        self.pb_update_low_high.clicked.connect(self.updateImageDictionary)
-        self.listWidget.itemClicked.connect(self.editImageProperties)
-        self.listWidget.itemDoubleClicked.connect(self.showOneImageOnly)
-        self.pb_show_selected.clicked.connect(self.showOneImageOnly)
-        self.pb_show_all.clicked.connect(self.showAllItems)
-        self.actionLoad_State_File.triggered.connect(self.importState)
-        self.actionSave_State.triggered.connect(self.exportState)
-        self.actionSave_View.triggered.connect(self.saveImage)
-
-    def buildFromDictionary(self):
-        if self.image_dict is not None:
-            self.createMultiColorView(self.image_dict)
-            self.displayImageNames(self.image_dict)
-        else:
-            pass
-
-    def generateImageDictionary(self):
-        """Creates a dictionary contains image path, color scheme chosen, throshold limits etc.
-        when user edits the parameters dictionary will be updated and unwrapped for display later.
-        This dictionary is saved as json file while saving the state. Two image loading options are possible.
-        User can either select multiple 2D array images or one 3D array (stack)"""
-
-        clickedAction = self.sender()
-
-        if clickedAction.text() == "Load Images":
-            # multiple images are selected
-            self.loadMultipleImageFiles()
-
-        elif clickedAction.text() == "Load Stack":
-            # an image stack is selected
-            self.loadAsStack()
-
-    def loadMultipleImageFiles(self):
-        filter = "TIFF (*.tiff);;TIF (*.tif)"
-        QtWidgets.QFileDialog().setFileMode(QtWidgets.QFileDialog.ExistingFiles)
-        # choose mutliple tiff files
-        names = QtWidgets.QFileDialog().getOpenFileNames(self, "Open files", " ", filter)
-        if names[0]:
-            self.image_dict = {}
-            # select the file directory. Image files are expected to be in the same folder
-            self.imageDir = os.path.dirname(names[0][0])
-
-            # create the dictionary
-            for colorName, image in zip(cmap_dict.keys(), names[0]):
-                # squeeze to allow with pseudo 3D axis from some tomo recon (eg. 1, 100,100 array)
-                im_array = np.squeeze(tf.imread(image))
-                # set values for thresholding as image min and max
-                low, high = np.min(im_array), np.max(im_array)
-                # name of the tiff file is chosen as key for the dictionary,
-                # inner keys are properties set for that image
-                im_name = os.path.basename(image)
-                # construct the dictionary
-                self.image_dict[f"{os.path.basename(image)}"] = {
-                    "ImageName": im_name,
-                    "ImageDir": self.imageDir,
-                    "Image": im_array,
-                    "Color": colorName,
-                    "CmapLimits": (low, high),
-                    "Opacity": 1.0,
-                }
-        else:
-            pass
-
-    def loadAsStack(self):
-        """construct the dictionary with image +number as the key.
-        All other steps are similar to the loadMultipleImageFiles function"""
-
-        filter = "TIFF (*.tiff);;TIF (*.tif)"
-        file_name = QtWidgets.QFileDialog().getOpenFileName(
-            self, "Open a Stack", "", "TIFF(*tiff *tif);;all_files (*)", filter
-        )
-        if file_name[0]:
-            self.imageDir = os.path.dirname(file_name[0])
-            self.image_dict = {}
-            im_stack = np.squeeze(tf.imread(file_name[0]))
-            # asset the file is a stack
-            assert im_stack.ndim == 3, "Not a stack"
-            # construct the dictionary
-            for n, (colorName, image) in enumerate(zip(cmap_dict.keys(), im_stack)):
-                low, high = np.min(image), np.max(image)
-                self.image_dict[f"Image {n+1}"] = {
-                    "ImageName": f"Image {n+1}",
-                    "ImageDir": self.imageDir,
-                    "Image": image,
-                    "Color": colorName,
-                    "CmapLimits": (low, high),
-                    "Opacity": 1.0,
-                }
-
-    def loadAnImage(self, image, colormap, cmap_limits, opacity=1):
-        """load single image and colorbar to the widget. This function will be looped for
-        multiple images later
-        """
-        # get pg image item
-        img = pg.ImageItem()
-        # add image to the graphicsview widget
-        self.canvas.addItem(img)
-        # set the color map
-        cmap = pg.ColorMap(pos=np.linspace(0, 1, len(colormap)), color=colormap)
-        # image = np.squeeze(tf.imread(image_path))
-        # set image to the image item with cmap
-        img.setImage(np.array(image), lut=cmap.getLookupTable(), opacity=opacity)
-
-        # set colorbar for thresholding
-        bar = pg.ColorBarItem(values=cmap_limits, cmap=cmap, limits=(0, None), orientation="vertical")
-        bar.setImageItem(img)
-        # set composition mode to plus for overlaying
-        img.setCompositionMode(QtGui.QPainter.CompositionMode_Plus)
-
-    def createMultiColorView(self, image_dictionary):
-        """Function creates multi color image view by taking image
-        data and parameters from the dictionary"""
-
-        # clear the plots and list in case of re-loading
-        self.canvas.clear()
-        self.listWidget.clear()
-
-        # display individual images in for loop
-        for path_and_color in image_dictionary.values():
-            self.loadAnImage(
-                path_and_color["Image"],
-                cmap_dict[path_and_color["Color"]],
-                path_and_color["CmapLimits"],
-                path_and_color["Opacity"],
-            )
-
-    def showOneImageOnly(self):
-        editItem = self.listWidget.currentItem()
-        editRow = self.listWidget.currentRow()
-        for i in range(self.listWidget.count()):
-            if self.listWidget.item(i) == editItem:
-                editItemName = self.listWidget.item(i).text().split(",")[0]
-                self.image_dict[editItemName]["Opacity"] = 1
-
-            elif self.listWidget.item(i) != editItem:
-                editItemName = self.listWidget.item(i).text().split(",")[0]
-                self.image_dict[editItemName]["Opacity"] = 0
-
-        self.createMultiColorView(self.image_dict)
-        self.displayImageNames(self.image_dict)
-        self.listWidget.setCurrentRow(editRow)
-
-    def showAllItems(self):
-        # editItem = self.listWidget.currentItem()
-        editRow = self.listWidget.currentRow()
-        for i in range(self.listWidget.count()):
-            editItemName = self.listWidget.item(i).text().split(",")[0]
-            self.image_dict[editItemName]["Opacity"] = 1
-
-        self.createMultiColorView(self.image_dict)
-        self.displayImageNames(self.image_dict)
-        self.listWidget.setCurrentRow(editRow)
-
-    def displayImageNames(self, image_dictionary):
-        """Populate the list widget table with image name and color used to plot,
-        using image dictionary input"""
-
-        for im_name, vals in image_dictionary.items():
-            self.listWidget.addItem(f"{im_name},{vals['Color']}")
-            self.listWidget.setCurrentRow(0)
-
-    def createMuliColorAndList(self):
-        """Finally Load Images and poplulate the list widget from the dictionary"""
-        with pg.BusyCursor():  # gives the circle showing gui is doing something
-            self.generateImageDictionary()
-            if self.image_dict:
-                self.createMultiColorView(self.image_dict)
-                self.displayImageNames(self.image_dict)
-
-            else:
-                pass
-
-    def sliderSetUp(self, im_array):
-        """Setting the slider min and max from image values"""
-
-        low = (np.min(im_array) / np.max(im_array)) * 100
-        self.sldr_low.setMaximum(100)
-        self.sldr_low.setMinimum(low)
-        self.sldr_high.setMaximum(100)
-        self.sldr_high.setMinimum(low)
-
-    def editImageProperties(self, item):
-        """function to control the assigned properties such as color,
-        threshold limits, opacity etc of a single image selected using the list widget item"""
-
-        editItem = item.text()
-        # get the dictionary key from item text
-        editItemName = editItem.split(",")[0]
-        editItemColor = editItem.split(",")[1]
-        im_array = self.image_dict[editItemName]["Image"]
-        self.sliderSetUp(im_array)
-        setValLow = (self.image_dict[editItemName]["CmapLimits"][0] * 100) / np.max(im_array)
-        setValHigh = (self.image_dict[editItemName]["CmapLimits"][1] * 100) / np.max(im_array)
-        setOpacity = self.image_dict[editItemName]["Opacity"] * 100
-        self.sldr_low.setValue(int(setValLow))
-        self.sldr_high.setValue(int(setValHigh))
-        self.sldr_opacity.setValue(int(setOpacity))
-        self.low_high_vals.setText(f"low:{self.sldr_low.value()}," f"high:{self.sldr_high.value()}")
-        self.cb_choose_color.setCurrentText(editItemColor)
-
-    def updateImageDictionary(self):
-        newColor = self.cb_choose_color.currentText()
-        editItem = self.listWidget.currentItem().text()
-        editRow = self.listWidget.currentRow()
-        editItemName = editItem.split(",")[0]
-        self.imageDir = self.image_dict[editItemName]["ImageDir"]
-        im_array = self.image_dict[editItemName]["Image"]
-        self.sliderSetUp(im_array)
-        cmap_limits = (
-            self.sldr_low.value() * np.max(im_array) / 100,
-            self.sldr_high.value() * np.max(im_array) / 100,
-        )
-        self.low_high_vals.setText(f"low:{cmap_limits[0]:.3f},high:{cmap_limits[1]:.3f}")
-        opacity = self.sldr_opacity.value() / 100
-        self.opacity_val.setText(str(opacity))
-        self.image_dict[editItemName] = {
-            "ImageName": editItemName,
-            "ImageDir": self.imageDir,
-            "Image": im_array,
-            "Color": newColor,
-            "CmapLimits": cmap_limits,
-            "Opacity": opacity,
-        }
-
-        self.createMultiColorView(self.image_dict)
-        self.displayImageNames(self.image_dict)
-        self.listWidget.setCurrentRow(editRow)
-
-    def exportState(self):
-        file_name = QtWidgets.QFileDialog().getSaveFileName(
-            self, "Save Current State", "multicolor_params.json", "json file(*json)"
-        )
-        """
-        for val in self.image_dict.values():
-            val['CmapLimits'] = json.dumps(str(val['CmapLimits']))
-        """
-
-        if file_name[0]:
-            with open(f"{file_name[0]}", "w") as fp:
-                json.dump(self.image_dict, fp, indent=4, cls=jsonEncoder)
-
-        else:
-            pass
-
-    def importState(self):
-        file_name = QtWidgets.QFileDialog().getOpenFileName(
-            self, "Open a State File", "", "json file(*json);;all_files (*)"
-        )
-        if file_name[0]:
-            with open(file_name[0], "r") as fp:
-                self.image_dict = json.load(fp)
-
-            self.createMultiColorView(self.image_dict)
-            self.displayImageNames(self.image_dict)
-        else:
-            pass
-
-    def saveImage(self):
-        file_name = QtWidgets.QFileDialog().getSaveFileName(
-            self, "Save Image", "multicolor_image.png", "PNG(*.png);; TIFF(*.tiff);; JPG(*.jpg)"
-        )
-        exporter = pg.exporters.ImageExporter(self.canvas.getViewBox())
-        exporter.export(file_name[0])
-
-
-""" Helper Functions"""
-
-
-def get_xrf_data(h="h5file"):
-    """
-    get xrf stack from h5 data generated at NSLS-II beamlines
-
-     Arguments:
-        h5/hdf5 file
-
-     Returns:
-         norm_xrf_stack -  xrf stack image normalized with Io
-         mono_e  - excitation enegy used for xrf
-         beamline - identity of the beamline
-         Io_avg - an average Io value, used before taking log
-
-    """
-
-    f = h5py.File(h, "r")
-
-    if list(f.keys())[0] == "xrfmap":
-        logger.info("Data from HXN/TES/SRX")
-        beamline = f["xrfmap/scan_metadata"].attrs["scan_instrument_id"]
-
-        try:
-            beamline_scalar = {"HXN": 2, "SRX": 0, "TES": 0}
-
-            if beamline in beamline_scalar.keys():
-                Io = np.array(f["xrfmap/scalers/val"])[:, :, beamline_scalar[beamline]]
-                raw_xrf_stack = np.array(f["xrfmap/detsum/counts"])
-                norm_xrf_stack = raw_xrf_stack
-                Io_avg = int(remove_nan_inf(Io).mean())
-            else:
-                logger.error("Unknown Beamline Scalar")
-        except Exception:
-            logger.warning("Unknown Scalar: Raw Detector count in use")
-            norm_xrf_stack = np.array(f["xrfmap/detsum/counts"])
-
-    elif list(f.keys())[0] == "xrmmap":
-        logger.info("Data from XFM")
-        beamline = "XFM"
-        raw_xrf_stack = np.array(f["xrmmap/mcasum/counts"])
-        Io = np.array(f["xrmmap/scalars/I0"])
-        norm_xrf_stack = raw_xrf_stack
-        Io_avg = int(remove_nan_inf(Io).mean())
-
-    else:
-        logger.error("Unknown Data Format")
-
-    try:
-        mono_e = int(f["xrfmap/scan_metadata"].attrs["instrument_mono_incident_energy"] * 1000)
-        logger.info("Excitation energy was taken from the h5 data")
-
-    except Exception:
-        mono_e = 12000
-        logger.info(f"Unable to get Excitation energy from the h5 data; using default value {mono_e} KeV")
-
-    return remove_nan_inf(norm_xrf_stack.transpose((2, 0, 1))), mono_e + 1500, beamline, Io_avg
-
-
-def remove_nan_inf(im):
-    im = np.array(im, dtype=np.float32)
-    im[np.isnan(im)] = 0
-    im[np.isinf(im)] = 0
-    return im
-
-
-def rebin_image(im, bin_factor):
-    arrx, arry = np.shape(im)
-    if arrx / bin_factor != int or arrx / bin_factor != int:
-        logger.error("Invalid Binning")
-
-    else:
-        shape = (arrx / bin_factor, arry / bin_factor)
-        return im.reshape(shape).mean(-1).mean(1)
-
-
-def remove_hot_pixels(image_array, NSigma=5):
-    image_array = remove_nan_inf(image_array)
-    a, b, c = np.shape(image_array)
-    img_stack2 = np.zeros((a, b, c))
-    for i in range(a):
-        im = image_array[i, :, :]
-        im[abs(im) > np.std(im) * NSigma] = im.mean()
-        img_stack2[i, :, :] = im
-    return img_stack2
-
-
-def smoothen(image_array, w_size=5):
-    a, b, c = np.shape(image_array)
-    spec2D_Matrix = np.reshape(image_array, (a, (b * c)))
-    smooth2D_Matrix = savgol_filter(spec2D_Matrix, w_size, w_size - 2, axis=0)
-    return remove_nan_inf(np.reshape(smooth2D_Matrix, (a, b, c)))
-
-
-def resize_stack(image_array, upscaling=False, scaling_factor=2):
-    en, im1, im2 = np.shape(image_array)
-
-    if upscaling:
-        im1_ = im1 * scaling_factor
-        im2_ = im2 * scaling_factor
-        img_stack_resized = resize(image_array, (en, im1_, im2_))
-
-    else:
-        im1_ = int(im1 / scaling_factor)
-        im2_ = int(im2 / scaling_factor)
-        img_stack_resized = resize(image_array, (en, im1_, im2_))
-
-    return img_stack_resized
-
-
-def normalize(image_array, norm_point=-1):
-    norm_stack = image_array / image_array[norm_point]
-    return remove_nan_inf(norm_stack)
-
-
-def remove_edges(image_array):
-    # z, x, y = np.shape(image_array)
-    return image_array[:, 1:-1, 1:-1]
-
-
-def background_value(image_array):
-    img = image_array.mean(0)
-    img_h = img.mean(0)
-    img_v = img.mean(1)
-    h = np.gradient(img_h)
-    v = np.gradient(img_v)
-    bg = np.min([img_h[h == h.max()], img_v[v == v.max()]])
-    return bg
-
-
-def background_subtraction(img_stack, bg_percentage=10):
-    img_stack = remove_nan_inf(img_stack)
-    a, b, c = np.shape(img_stack)
-    ref_image = np.reshape(img_stack.mean(0), (b * c))
-    bg_ratio = int((b * c) * 0.01 * bg_percentage)
-    bg_ = np.max(sorted(ref_image)[0:bg_ratio])
-    bged_img_stack = img_stack - bg_[:, np.newaxis, np.newaxis]
-    return bged_img_stack
-
-
-def background_subtraction2(img_stack, bg_percentage=10):
-    img_stack = remove_nan_inf(img_stack)
-    a, b, c = np.shape(img_stack)
-    bg_ratio = int((b * c) * 0.01 * bg_percentage)
-    bged_img_stack = img_stack.copy()
-
-    for n, img in enumerate(img_stack):
-        bg_ = np.max(sorted(img.flatten())[0:bg_ratio])
-        print(bg_)
-        bged_img_stack[n] = img - bg_
-
-    return remove_nan_inf(bged_img_stack)
-
-
-def background1(img_stack):
-    img = img_stack.sum(0)
-    img_h = img.mean(0)
-    img_v = img.mean(1)
-    h = np.gradient(img_h)
-    v = np.gradient(img_v)
-    bg = np.min([img_h[h == h.max()], img_v[v == v.max()]])
-    return bg
-
-
-def get_sum_spectra(image_array):
-    spec = np.sum(image_array, axis=(1, 2))
-    return spec
-
-
-def get_mean_spectra(image_array):
-    spec = np.mean(image_array, axis=(1, 2))
-    return spec
-
-
-def flatten_(image_array):
-    z, x, y = np.shape(image_array)
-    flat_array = np.reshape(image_array, (x * y, z))
-    return flat_array
-
-
-def image_to_pandas(image_array):
-    a, b, c = np.shape(image_array)
-    im_array = np.reshape(image_array, ((b * c), a))
-    a, b = im_array.shape
-    df = pd.DataFrame(
-        data=im_array[:, :], columns=["e" + str(i) for i in range(b)], index=["s" + str(i) for i in range(a)]
-    )
-    return df
-
-
-def image_to_pandas2(image_array):
-    a, b, c = np.shape(image_array)
-    im_array = np.reshape(image_array, (a, (b * c)))
-    a, b = im_array.shape
-    df = pd.DataFrame(
-        data=im_array[:, :], index=["e" + str(i) for i in range(a)], columns=["s" + str(i) for i in range(b)]
-    )
-    return df
-
-
-def neg_log(image_array):
-    absorb = -1 * np.log(image_array)
-    return remove_nan_inf(absorb)
-
-
-def clean_stack(img_stack, auto_bg=False, bg_percentage=5):
-    a, b, c = np.shape(img_stack)
-
-    if auto_bg is True:
-        bg_ = background1(img_stack)
-
-    else:
-        sum_spec = (img_stack.sum(1)).sum(1)
-        ref_stk_num = np.where(sum_spec == sum_spec.max())[-1]
-
-        ref_image = np.reshape(img_stack[ref_stk_num], (b * c))
-        bg_ratio = int((b * c) * 0.01 * bg_percentage)
-        bg_ = np.max(sorted(ref_image)[0:bg_ratio])
-
-    bg = np.where(img_stack[ref_stk_num] > bg_, img_stack[ref_stk_num], 0)
-    bg2 = np.where(bg < bg_, bg, 1)
-
-    bged_img_stack = img_stack * bg2
-
-    return remove_nan_inf(bged_img_stack)
-
-
-def subtractBackground(im_stack, bg_region):
-    if bg_region.ndim == 3:
-        bg_region_ = np.mean(bg_region, axis=(1, 2))
-
-    elif bg_region.ndim == 2:
-        bg_region_ = np.mean(bg_region, axis=1)
-
-    else:
-        bg_region_ = bg_region
-
-    return im_stack - bg_region_[:, np.newaxis, np.newaxis]
-
-
-def classify(img_stack, correlation="Pearson"):
-    img_stack_ = img_stack
-    a, b, c = np.shape(img_stack_)
-    norm_img_stack = normalize(img_stack_)
-    f = np.reshape(norm_img_stack, (a, (b * c)))
-
-    max_x, max_y = np.where(norm_img_stack.sum(0) == (norm_img_stack.sum(0)).max())
-    ref = norm_img_stack[:, int(max_x), int(max_y)]
-    corr = np.zeros(len(f.T))
-    for s in range(len(f.T)):
-        if correlation == "Kendall":
-            r, p = stats.kendalltau(ref, f.T[s])
-        elif correlation == "Pearson":
-            r, p = stats.pearsonr(ref, f.T[s])
-
-        corr[s] = r
-
-    cluster_image = np.reshape(corr, (b, c))
-    return (cluster_image**3), img_stack_
-
-
-def correlation_kmeans(img_stack, n_clusters, correlation="Pearson"):
-    img, bg_image = classify(img_stack, correlation)
-    img[np.isnan(img)] = -99999
-    X = img.reshape((-1, 1))
-    k_means = sc.KMeans(n_clusters)
-    k_means.fit(X)
-
-    X_cluster = k_means.labels_
-    X_cluster = X_cluster.reshape(img.shape) + 1
-
-    return X_cluster
-
-
-def cluster_stack(
-    im_array, method="KMeans", n_clusters_=4, decomposed=False, decompose_method="PCA", decompose_comp=2
-):
-    a, b, c = im_array.shape
-
-    if method == "Correlation-Kmeans":
-        X_cluster = correlation_kmeans(im_array, n_clusters_, correlation="Pearson")
-
-    else:
-        methods = {
-            "MiniBatchKMeans": sc.MiniBatchKMeans,
-            "KMeans": sc.KMeans,
-            "MeanShift": sc.MeanShift,
-            "Spectral Clustering": sc.SpectralClustering,
-            "Affinity Propagation": sc.AffinityPropagation,
-        }
-
-        if decomposed:
-            im_array = denoise_with_decomposition(im_array, method_=decompose_method, n_components=decompose_comp)
-
-        flat_array = np.reshape(im_array, (a, (b * c)))
-        init_cluster = methods[method](n_clusters=n_clusters_)
-        init_cluster.fit(np.transpose(flat_array))
-        X_cluster = init_cluster.labels_.reshape(b, c) + 1
-
-    decon_spectra = np.zeros((a, n_clusters_))
-    decon_images = np.zeros((n_clusters_, b, c))
-
-    for i in range(n_clusters_):
-        mask_i = np.where(X_cluster == (i + 1), X_cluster, 0)
-        spec_i = get_sum_spectra(im_array * mask_i)
-        decon_spectra[:, i] = spec_i
-        decon_images[i] = im_array.sum(0) * mask_i
-
-    return decon_images, X_cluster, decon_spectra
-
-
-def kmeans_variance(im_array):
-    a, b, c = im_array.shape
-    flat_array = np.reshape(im_array, (a, (b * c)))
-    var = np.arange(24)
-    clust_n = np.arange(24) + 2
-
-    for clust in var:
-        init_cluster = sc.KMeans(n_clusters=int(clust + 2))
-        init_cluster.fit(np.transpose(flat_array))
-        var_ = init_cluster.inertia_
-        var[clust] = np.float64(var_)
-
-    kmeans_var_plot = pg.plot(
-        clust_n, var, title="KMeans Variance", pen=pg.mkPen("y", width=2, style=QtCore.Qt.DotLine), symbol="o"
-    )
-    kmeans_var_plot.setLabel("bottom", "Cluster Number")
-    kmeans_var_plot.setLabel("left", "Sum of squared distances")
-
-
-def pca_scree(im_stack):
-    new_image = im_stack.transpose(2, 1, 0)
-    x, y, z = np.shape(new_image)
-    img_ = np.reshape(new_image, (x * y, z))
-    pca = sd.PCA(z)
-    pca.fit(img_)
-    # var = pca.explained_variance_ratio_
-    var = pca.singular_values_
-
-    pca_scree_plot = pg.plot(
-        var[:24], title="PCA Scree Plot", pen=pg.mkPen("y", width=2, style=QtCore.Qt.DotLine), symbol="o"
-    )
-    pca_scree_plot.addLine(y=0)
-    pca_scree_plot.setLabel("bottom", "Component Number")
-    pca_scree_plot.setLabel("left", "Singular Values")
-
-
-def decompose_stack(im_stack, decompose_method="PCA", n_components_=3):
-    new_image = im_stack.transpose(2, 1, 0)
-    x, y, z = np.shape(new_image)
-    img_ = np.reshape(new_image, (x * y, z))
-    methods_dict = {
-        "PCA": sd.PCA,
-        "IncrementalPCA": sd.IncrementalPCA,
-        "NMF": sd.NMF,
-        "FastICA": sd.FastICA,
-        "DictionaryLearning": sd.MiniBatchDictionaryLearning,
-        "FactorAnalysis": sd.FactorAnalysis,
-        "TruncatedSVD": sd.TruncatedSVD,
-    }
-
-    _mdl = methods_dict[decompose_method](n_components=n_components_)
-
-    ims = (_mdl.fit_transform(img_).reshape(x, y, n_components_)).transpose(2, 1, 0)
-    spcs = _mdl.components_.transpose()
-    decon_spetra = np.zeros((z, n_components_))
-    decom_map = np.zeros((ims.shape))
-
-    for i in range(n_components_):
-        f = ims.copy()[i]
-        f[f < 0] = 0
-        spec_i = ((new_image.T * f).sum(1)).sum(1)
-        decon_spetra[:, i] = spec_i
-
-        f[f > 0] = i + 1
-        decom_map[i] = f
-    decom_map = decom_map.sum(0)
-
-    return np.float32(ims), spcs, decon_spetra, decom_map
-
-
-def denoise_with_decomposition(img_stack, method_="PCA", n_components=4):
-    new_image = img_stack.transpose(2, 1, 0)
-    x, y, z = np.shape(new_image)
-    img_ = np.reshape(new_image, (x * y, z))
-
-    methods_dict = {
-        "PCA": sd.PCA,
-        "IncrementalPCA": sd.IncrementalPCA,
-        "NMF": sd.NMF,
-        "FastICA": sd.FastICA,
-        "DictionaryLearning": sd.DictionaryLearning,
-        "FactorAnalysis": sd.FactorAnalysis,
-        "TruncatedSVD": sd.TruncatedSVD,
-    }
-
-    decomposed = methods_dict[method_](n_components=n_components)
-
-    ims = (decomposed.fit_transform(img_).reshape(x, y, n_components)).transpose(2, 1, 0)
-    ims[ims < 0] = 0
-    ims[ims > 0] = 1
-    mask = ims.sum(0)
-    mask[mask > 1] = 1
-    # mask = uniform_filter(mask)
-    filtered = img_stack * mask
-    # plt.figure()
-    # plt.imshow(filtered.sum(0))
-    # plt.title('background removed')
-    # plt.show()
-    return remove_nan_inf(filtered)
-
-
-def interploate_E(refs, e):
-    n = np.shape(refs)[1]
-    refs = np.array(refs)
-    ref_e = refs[:, 0]
-    ref = refs[:, 1:n]
-    all_ref = []
-    for i in range(n - 1):
-        ref_i = np.interp(e, ref_e, ref[:, i])
-        all_ref.append(ref_i)
-    return np.array(all_ref)
-
-
-def getStats(spec, fit, num_refs=2):
-    stats = {}
-
-    r_factor = (np.sum(spec - fit) ** 2) / np.sum(spec**2)
-    stats["R_Factor"] = np.around(r_factor, 5)
-
-    y_mean = np.sum(spec) / len(spec)
-    SS_tot = np.sum((spec - y_mean) ** 2)
-    SS_res = np.sum((spec - fit) ** 2)
-    r_square = 1 - (SS_res / SS_tot)
-    stats["R_Square"] = np.around(r_square, 4)
-
-    chisq = np.sum((spec - fit) ** 2)
-    stats["Chi_Square"] = np.around(chisq, 5)
-
-    red_chisq = chisq / (len(spec) - num_refs)
-    stats["Reduced Chi_Square"] = red_chisq
-
-    return stats
-
-
-def xanes_fitting_1D(spec, e_list, refs, method="NNLS", alphaForLM=0.01):
-    """Linear combination fit of image data with reference standards"""
-
-    int_refs = interploate_E(refs, e_list)
-
-    if method == "NNLS":
-        coeffs, r = opt.nnls(int_refs.T, spec)
-
-    elif method == "LASSO":
-        lasso = linear_model.Lasso(positive=True, alpha=alphaForLM)  # lowering alpha helps with 1D fits
-        fit_results = lasso.fit(int_refs.T, spec)
-        coeffs = fit_results.coef_
-
-    elif method == "RIDGE":
-        ridge = linear_model.Ridge(alpha=alphaForLM)
-        fit_results = ridge.fit(int_refs.T, spec)
-        coeffs = fit_results.coef_
-
-    fit = coeffs @ int_refs
-    stats = getStats(spec, fit, num_refs=np.min(np.shape(int_refs.T)))
-
-    return stats, coeffs
-
-
-def xanes_fitting(im_stack, e_list, refs, method="NNLS", alphaForLM=0.1, binStack=False):
-    """Linear combination fit of image data with reference standards"""
-
-    if binStack:
-        im_stack = resize_stack(im_stack, scaling_factor=4)
-
-    en, im1, im2 = np.shape(im_stack)
-    im_array = im_stack.reshape(en, im1 * im2)
-    coeffs_arr = []
-    r_factor_arr = []
-    # lasso = linear_model.Lasso(positive=True, alpha=alphaForLM)
-    for n, i in enumerate(range(im1 * im2)):
-        stats, coeffs = xanes_fitting_1D(im_array[:, i], e_list, refs, method=method, alphaForLM=alphaForLM)
-        coeffs_arr.append(coeffs)
-        r_factor_arr.append(stats["R_Factor"])
-
-    abundance_map = np.reshape(coeffs_arr, (im1, im2, -1))
-    r_factor_im = np.reshape(r_factor_arr, (im1, im2))
-
-    return abundance_map, r_factor_im, np.mean(coeffs_arr, axis=0)
-
-
-def xanes_fitting_Line(im_stack, e_list, refs, method="NNLS", alphaForLM=0.05):
-    """Linear combination fit of image data with reference standards"""
-    en, im1, im2 = np.shape(im_stack)
-    im_array = np.mean(im_stack, 2)
-    coeffs_arr = []
-    meanStats = {"R_Factor": 0, "R_Square": 0, "Chi_Square": 0, "Reduced Chi_Square": 0}
-
-    for i in range(im1):
-        stats, coeffs = xanes_fitting_1D(im_array[:, i], e_list, refs, method=method, alphaForLM=alphaForLM)
-        coeffs_arr.append(coeffs)
-        for key in stats.keys():
-            meanStats[key] += stats[key]
-
-    for key, vals in meanStats.items():
-        meanStats[key] = np.around((vals / im1), 5)
-
-    return meanStats, np.mean(coeffs_arr, axis=0)
-
-
-def xanes_fitting_Binned(im_stack, e_list, refs, method="NNLS", alphaForLM=0.05):
-    """Linear combination fit of image data with reference standards"""
-
-    im_stack = resize_stack(im_stack, scaling_factor=10)
-    # use a simple filter to find threshold value
-    val = filters.threshold_otsu(im_stack[-1])
-    en, im1, im2 = np.shape(im_stack)
-    im_array = im_stack.reshape(en, im1 * im2)
-    coeffs_arr = []
-    meanStats = {"R_Factor": 0, "R_Square": 0, "Chi_Square": 0, "Reduced Chi_Square": 0}
-
-    specs_fitted = 0
-    total_spec = im1 * im2
-    for i in range(total_spec):
-        spec = im_array[:, i]
-        # do not fit low intensity/background regions
-        if spec[-1] > val:
-            specs_fitted += 1
-            stats, coeffs = xanes_fitting_1D(spec / spec[-1], e_list, refs, method=method, alphaForLM=alphaForLM)
-            coeffs_arr.append(coeffs)
-            for key in stats.keys():
-                meanStats[key] += stats[key]
-        else:
-            pass
-
-    for key, vals in meanStats.items():
-        meanStats[key] = np.around((vals / specs_fitted), 6)
-    # print(f"{specs_fitted}/{total_spec}")
-    return meanStats, np.mean(coeffs_arr, axis=0)
-
-
-def create_df_from_nor(athenafile="fe_refs.nor"):
-    """create pandas dataframe from athena nor file, first column
-    is energy and headers are sample names"""
-
-    refs = np.loadtxt(athenafile)
-    n_refs = refs.shape[-1]
-    skip_raw_n = n_refs + 6
-
-    df = pd.read_table(
-        athenafile, delim_whitespace=True, skiprows=skip_raw_n, header=None, usecols=np.arange(0, n_refs)
-    )
-    df2 = pd.read_table(
-        athenafile, delim_whitespace=True, skiprows=skip_raw_n - 1, usecols=np.arange(0, n_refs + 1)
-    )
-    new_col = df2.columns.drop("#")
-    df.columns = new_col
-    return df, list(new_col)
-
-
-def create_df_from_nor_try2(athenafile="fe_refs.nor"):
-    """create pandas dataframe from athena nor file, first column
-    is energy and headers are sample names"""
-
-    refs = np.loadtxt(athenafile)
-    n_refs = refs.shape[-1]
-    df_refs = pd.DataFrame(refs)
-
-    df = pd.read_csv(athenafile, header=None)
-    new_col = list((str(df.iloc[n_refs + 5].values)).split(" ")[2::2])
-    df_refs.columns = new_col
-
-    return df_refs, list(new_col)
-
-
-def energy_from_logfile(logfile="maps_log_tiff.txt"):
-    df = pd.read_csv(logfile, header=None, delim_whitespace=True, skiprows=9)
-    return df[9][df[7] == "energy"].values.astype(float)
-
-
-def xanesNormalization(
-    e, mu, e0=7125, step=None, nnorm=2, nvict=0, pre1=None, pre2=-50, norm1=100, norm2=None, guess=False
-):
-    if guess:
-        result = preedge(e, mu, e0, step=step, nnorm=nnorm, nvict=nvict)
-
-        return result["pre1"], result["pre2"], result["norm1"], result["norm2"]
-
-    else:
-        result = preedge(e, mu, e0, step, nnorm, nvict, pre1, pre2, norm1, norm2)
-
-        return result["pre_edge"], result["post_edge"], result["norm"]
-
-
-def xanesNormStack(
-    e_list, im_stack, e0=7125, step=None, nnorm=2, nvict=0, pre1=None, pre2=-50, norm1=100, norm2=None
-):
-    en, im1, im2 = np.shape(im_stack)
-    im_array = im_stack.reshape(en, im1 * im2)
-    normedStackArray = np.zeros_like(im_array)
-
-    for i in range(im1 * im2):
-        pre_line, post_line, normXANES = xanesNormalization(
-            e_list,
-            im_array[:, i],
-            e0=e0,
-            step=step,
-            nnorm=nnorm,
-            nvict=nvict,
-            pre1=pre1,
-            pre2=pre2,
-            norm1=norm1,
-            norm2=norm2,
-            guess=False,
-        )
-        normedStackArray[:, i] = normXANES
-
-    return remove_nan_inf(np.reshape(normedStackArray, (en, im1, im2)))
-
-
-def align_stack(
-    stack_img, ref_image_void=True, ref_stack=None, transformation=StackReg.TRANSLATION, reference="previous"
-):
-    """Image registration flow using pystack reg"""
-
-    # all the options are in one function
-
-    sr = StackReg(transformation)
-
-    if ref_image_void:
-        tmats_ = sr.register_stack(stack_img, reference=reference)
-
-    else:
-        tmats_ = sr.register_stack(ref_stack, reference=reference)
-        # out_ref = sr.transform_stack(ref_stack)
-
-    out_stk = sr.transform_stack(stack_img, tmats=tmats_)
-    return np.float32(out_stk), tmats_
-
-
-def align_simple(stack_img, transformation=StackReg.TRANSLATION, reference="previous"):
-    sr = StackReg(transformation)
-    tmats_ = sr.register_stack(stack_img, reference="previous")
-    for i in range(10):
-        out_stk = sr.transform_stack(stack_img, tmats=tmats_)
-        import time
-
-        time.sleep(2)
-    return np.float32(out_stk)
-
-
-def align_with_tmat(stack_img, tmat_file, transformation=StackReg.TRANSLATION):
-    sr = StackReg(transformation)
-    out_stk = sr.transform_stack(stack_img, tmats=tmat_file)
-    return np.float32(out_stk)
-
-
-def align_stack_iter(
-    stack,
-    ref_stack_void=True,
-    ref_stack=None,
-    transformation=StackReg.TRANSLATION,
-    method=("previous", "first"),
-    max_iter=2,
-):
-    if ref_stack_void:
-        ref_stack = stack
-
-    for i in range(max_iter):
-        sr = StackReg(transformation)
-        for ii in range(len(method)):
-            print(ii, method[ii])
-            tmats = sr.register_stack(ref_stack, reference=method[ii])
-            ref_stack = sr.transform_stack(ref_stack)
-            stack = sr.transform_stack(stack, tmats=tmats)
-
-    return np.float32(stack)
-
-
-def applyMaskGetMeanSpectrum(im_stack, mask):
-    """A 2d mask to multiply with the 3d xanes stack and returns mean spectrum"""
-
-    masked_stack = im_stack * mask
-    return get_mean_spectra(masked_stack)
-
-
-def modifyStack(
-    raw_stack,
-    normalizeStack=False,
-    normToPoint=-1,
-    applySmooth=False,
-    smoothWindowSize=3,
-    applyThreshold=False,
-    thresholdValue=0,
-    removeOutliers=False,
-    nSigmaOutlier=3,
-    applyTranspose=False,
-    transposeVals=(0, 1, 2),
-    applyCrop=False,
-    cropVals=(0, 1, 2),
-    removeEdges=False,
-    resizeStack=False,
-    upScaling=False,
-    binFactor=2,
-):
-    """A giant function to modify the stack with many possible operations.
-    all the changes can be saved to a jason file as a config file. Enabling and
-    distabling the sliders is a problem"""
-
-    """
-    normStack = normalize(raw_stack, norm_point=normToPoint)
-    smoothStack = smoothen(raw_stack, w_size= smoothWindowSize)
-    thresholdStack = clean_stack(raw_stack, auto_bg=False, bg_percentage = thresholdValue)
-    outlierStack = remove_hot_pixels(raw_stack, NSigma=nSigmaOutlier)
-    transposeStack = np.transpose(raw_stack, transposeVals)
-    croppedStack = raw_stack[cropVals]
-    edgeStack = remove_edges(raw_stack)
-    binnedStack = resize_stack(raw_stack,upscaling=upScaling,scaling_factor=binFactor)
-
-    """
-
-    if removeOutliers:
-        modStack = remove_hot_pixels(raw_stack, NSigma=nSigmaOutlier)
-
-    else:
-        modStack = raw_stack
-
-    if applyThreshold:
-        modStack = clean_stack(modStack, auto_bg=False, bg_percentage=thresholdValue)
-
-    else:
-        pass
-
-    if applySmooth:
-        modStack = smoothen(modStack, w_size=smoothWindowSize)
-
-    else:
-        pass
-
-    if applyTranspose:
-        modStack = np.transpose(modStack, transposeVals)
-
-    else:
-        pass
-
-    if applyCrop:
-        modStack = modStack[cropVals]
-
-    else:
-        pass
-
-    if normalizeStack:
-        modStack = normalize(raw_stack, norm_point=normToPoint)
-    else:
-        pass
-
-
 def start_xmidas():
     def formatter(prog):
         # Set maximum width such that printed help mostly fits in the RTD theme code block (documentation).
         return argparse.RawDescriptionHelpFormatter(prog, max_help_position=20, width=90)
-
+    
     parser = argparse.ArgumentParser(
         description=f"XMidas: v{__version__}",
         formatter_class=formatter,
     )
     parser.parse_args()
-
+    
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter(fmt="%(asctime)s : %(levelname)s : %(message)s")
     stream_handler = logging.StreamHandler()
@@ -4202,16 +2802,20 @@ def start_xmidas():
     if logger.hasHandlers():
         logger.handlers.clear()
     logger.addHandler(stream_handler)
-
     if version.parse(PYQT_VERSION_STR) >= version.parse("5.14"):
-        QApplication.setAttribute(QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+        QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(
+            QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+
 
     app = QtWidgets.QApplication(sys.argv)
     # app.setAttribute(QtCore.Qt.AA_Use96Dpi)
     window = midasWindow()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
     start_xmidas()
+
+__version__ = "1.0.0"  # or whatever version you want

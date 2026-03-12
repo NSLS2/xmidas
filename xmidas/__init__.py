@@ -1,4 +1,3 @@
-from ._version import get_versions
+# xmidas/__init__.py
+__version__ = "1.0.0"
 
-__version__ = get_versions()["version"]
-del get_versions

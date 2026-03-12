@@ -86,3 +86,6 @@ target/
 *.png
 *.nor
 *.ipynb
+# pixi environments
+.pixi/*
+!.pixi/config.toml

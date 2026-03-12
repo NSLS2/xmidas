@@ -2,10 +2,14 @@
 Credits
 =======
 
-Maintainer
+Maintainers
 ----------
 
-* Brookhaven National Lab <>
+- Ajith Pattammattel <pattammattel@bnl.gov>
+- Dmitri Gavrilov <dgavrilov@bnl.gov>
+
+*Brookhaven National Laboratory*
+
 
 Contributors
 ------------

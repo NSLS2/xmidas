@@ -9,7 +9,7 @@ Supported Formats
 XRF Data
 --------
 
-MIDAS can unpack fluorescence .h5 data from NSLS-II beamlines, HXN, XFM, SRX, and TES.XRF data will be normalized with the I0 (scalar) value on the file.
+XMidas can unpack fluorescence .h5 data from NSLS-II beamlines- HXN, XFM, SRX, and TES.XRF data will be normalized with the I0 (scalar) value on the file.
 
 2D-XANES Data
 -------------
@@ -27,7 +27,7 @@ You can load it using the following methods,
 
 2. if you name the energy txt file matching the image file name, the program loads it automatically (like 'test.tiff' , 'test.txt').
 
-3. In the folder you exported xanes data from the beamline there should be a file named 'maps_log_tiff.txt'. Copy this to the same folder as the image file, then Midas automatically load energy when you open the image.
+3. In the folder you exported xanes data from the beamline there should be a log file named 'maps_log_tiff.txt'. Copy this to the same folder as the image file, then XMidas automatically load energy when you open the image.
 
 
 Create an image stack
